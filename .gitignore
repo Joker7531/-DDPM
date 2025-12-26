@@ -1,0 +1,13 @@
+results/
+output/
+logs/
+checkpoints/
+Dataset/
+__pycache__/
+
+*.pyc
+*.png
+*.pth
+*.pt
+*.jpg
+*.zip
