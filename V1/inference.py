@@ -146,19 +146,19 @@ class EEGDenoiser:
         """
         return signal - np.mean(signal)
     
-    def _highpass_filter(self, signal: np.ndarray, fs: float = 500.0) -> np.ndarray:
+    def _highpass_filter(self, x: np.ndarray, fs: float = 500.0) -> np.ndarray:
         """
         高通滤波：移除低频漂移
         
         Args:
-            signal: 输入信号 [T]
+            x: 输入信号 [T]
             fs: 采样率 (Hz)
             
         Returns:
             filtered: 滤波后的信号 [T]
         """
         if self.highpass_freq <= 0:
-            return signal
+            return x
         
         # 设计Butterworth高通滤波器
         nyq = 0.5 * fs
@@ -168,7 +168,7 @@ class EEGDenoiser:
         b, a = signal.butter(4, normal_cutoff, btype='high', analog=False)
         
         # 使用filtfilt进行零相位滤波
-        filtered = signal.filtfilt(b, a, signal)
+        filtered = signal.filtfilt(b, a, x)
         
         return filtered
     
