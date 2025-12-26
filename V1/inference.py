@@ -11,6 +11,7 @@ from typing import Optional, Tuple
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import warnings
+from scipy import signal
 
 from model import ConditionalDiffWave
 from diffusion import GaussianDiffusion
@@ -36,17 +37,24 @@ class EEGDenoiser:
         device: str = 'cuda',
         segment_length: int = 2048,
         hop_length: int = 1024,  # 50% 重叠
-        use_amp: bool = True
+        use_amp: bool = True,
+        baseline_correction: bool = True,
+        highpass_freq: float = 0.5  # 高通滤波截止频率 (Hz)
     ):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.segment_length = segment_length
         self.hop_length = hop_length
         self.use_amp = use_amp
+        self.baseline_correction = baseline_correction
+        self.highpass_freq = highpass_freq
         
         print(f"Loading model from: {model_path}")
         print(f"Device: {self.device}")
         print(f"Segment length: {segment_length} samples ({segment_length/500:.2f}s @ 500Hz)")
         print(f"Hop length: {hop_length} samples (overlap: {(1 - hop_length/segment_length)*100:.1f}%)")
+        print(f"Baseline correction: {baseline_correction}")
+        if baseline_correction and highpass_freq > 0:
+            print(f"Highpass filter: {highpass_freq} Hz")
         
         # 创建模型
         model = ConditionalDiffWave(
@@ -126,6 +134,44 @@ class EEGDenoiser:
         """
         return segment * std + mean
     
+    def _baseline_correct(self, signal: np.ndarray) -> np.ndarray:
+        """
+        基线校正：移除信号的DC分量（均值）
+        
+        Args:
+            signal: 输入信号 [T]
+            
+        Returns:
+            corrected: 基线校正后的信号 [T]
+        """
+        return signal - np.mean(signal)
+    
+    def _highpass_filter(self, signal: np.ndarray, fs: float = 500.0) -> np.ndarray:
+        """
+        高通滤波：移除低频漂移
+        
+        Args:
+            signal: 输入信号 [T]
+            fs: 采样率 (Hz)
+            
+        Returns:
+            filtered: 滤波后的信号 [T]
+        """
+        if self.highpass_freq <= 0:
+            return signal
+        
+        # 设计Butterworth高通滤波器
+        nyq = 0.5 * fs
+        normal_cutoff = self.highpass_freq / nyq
+        
+        # 使用4阶Butterworth滤波器
+        b, a = signal.butter(4, normal_cutoff, btype='high', analog=False)
+        
+        # 使用filtfilt进行零相位滤波
+        filtered = signal.filtfilt(b, a, signal)
+        
+        return filtered
+    
     @torch.no_grad()
     def denoise_segment(
         self,
@@ -160,6 +206,10 @@ class EEGDenoiser:
         
         # 反归一化
         denoised_denorm = self._denormalize_segment(denoised_np, mean, std)
+        
+        # 基线校正：强制拉回零基线
+        if self.baseline_correction:
+            denoised_denorm = self._baseline_correct(denoised_denorm)
         
         if return_input_stats:
             return denoised_denorm, mean, std
@@ -240,6 +290,14 @@ class EEGDenoiser:
         # 避免除零
         weights = np.maximum(weights, 1e-8)
         output = output / weights
+        
+        # 最终基线校正
+        if self.baseline_correction:
+            output = self._baseline_correct(output)
+            
+            # 可选：应用高通滤波器进一步移除低频漂移
+            if self.highpass_freq > 0:
+                output = self._highpass_filter(output, fs=500.0)
         
         return output
     
@@ -416,6 +474,10 @@ def main():
                         help='Disable automatic mixed precision')
     parser.add_argument('--no_comparison', action='store_true',
                         help='Do not save comparison plots')
+    parser.add_argument('--no_baseline_correction', action='store_true',
+                        help='Disable baseline correction (DC removal)')
+    parser.add_argument('--highpass_freq', type=float, default=0.5,
+                        help='Highpass filter cutoff frequency in Hz (default: 0.5, 0 to disable)')
     
     args = parser.parse_args()
     
@@ -425,7 +487,9 @@ def main():
         device=args.device,
         segment_length=args.segment_length,
         hop_length=args.hop_length,
-        use_amp=not args.no_amp
+        use_amp=not args.no_amp,
+        baseline_correction=not args.no_baseline_correction,
+        highpass_freq=args.highpass_freq
     )
     
     # 执行推理
