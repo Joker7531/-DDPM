@@ -39,7 +39,8 @@ class EEGDenoiser:
         hop_length: int = 1024,  # 50% 重叠
         use_amp: bool = True,
         baseline_correction: bool = True,
-        highpass_freq: float = 0.5  # 高通滤波截止频率 (Hz)
+        highpass_freq: float = 0.5,  # 高通滤波截止频率 (Hz)
+        sampling_timesteps: int = 100  # 快速采样步数（默认100步，原始1000步）
     ):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.segment_length = segment_length
@@ -47,11 +48,13 @@ class EEGDenoiser:
         self.use_amp = use_amp
         self.baseline_correction = baseline_correction
         self.highpass_freq = highpass_freq
+        self.sampling_timesteps = sampling_timesteps
         
         print(f"Loading model from: {model_path}")
         print(f"Device: {self.device}")
         print(f"Segment length: {segment_length} samples ({segment_length/500:.2f}s @ 500Hz)")
         print(f"Hop length: {hop_length} samples (overlap: {(1 - hop_length/segment_length)*100:.1f}%)")
+        print(f"Sampling timesteps: {sampling_timesteps} (accelerated from 1000)")
         print(f"Baseline correction: {baseline_correction}")
         if baseline_correction and highpass_freq > 0:
             print(f"Highpass filter: {highpass_freq} Hz")
@@ -71,7 +74,8 @@ class EEGDenoiser:
             timesteps=1000,
             beta_start=1e-4,
             beta_end=0.02,
-            loss_type='hybrid'
+            loss_type='hybrid',
+            sampling_timesteps=sampling_timesteps
         ).to(self.device)
         
         # 加载权重
@@ -197,9 +201,17 @@ class EEGDenoiser:
         # 推理
         if self.use_amp:
             with torch.cuda.amp.autocast():
-                denoised = self.diffusion.sample(condition)
+                denoised = self.diffusion.sample(
+                    condition, 
+                    ddim_sampling=True,
+                    show_progress=False  # 关闭进度条以加速
+                )
         else:
-            denoised = self.diffusion.sample(condition)
+            denoised = self.diffusion.sample(
+                condition,
+                ddim_sampling=True,
+                show_progress=False
+            )
         
         # 转换回numpy
         denoised_np = denoised.squeeze().cpu().numpy()
@@ -478,6 +490,8 @@ def main():
                         help='Disable baseline correction (DC removal)')
     parser.add_argument('--highpass_freq', type=float, default=0.5,
                         help='Highpass filter cutoff frequency in Hz (default: 0.5, 0 to disable)')
+    parser.add_argument('--sampling_timesteps', type=int, default=100,
+                        help='Number of sampling timesteps for fast inference (default: 100, max: 1000)')
     
     args = parser.parse_args()
     
@@ -489,7 +503,8 @@ def main():
         hop_length=args.hop_length,
         use_amp=not args.no_amp,
         baseline_correction=not args.no_baseline_correction,
-        highpass_freq=args.highpass_freq
+        highpass_freq=args.highpass_freq,
+        sampling_timesteps=args.sampling_timesteps
     )
     
     # 执行推理

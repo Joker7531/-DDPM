@@ -31,13 +31,15 @@ class GaussianDiffusion(nn.Module):
         timesteps: int = 1000,
         beta_start: float = 1e-4,
         beta_end: float = 0.02,
-        loss_type: str = 'hybrid'
+        loss_type: str = 'hybrid',
+        sampling_timesteps: Optional[int] = None  # DDIM采样步数，None表示使用全部步数
     ):
         super().__init__()
         
         self.model = model
         self.timesteps = timesteps
         self.loss_type = loss_type
+        self.sampling_timesteps = sampling_timesteps or timesteps
         
         # 创建STFT损失（用于hybrid模式）
         if loss_type in ['stft', 'hybrid']:
@@ -213,7 +215,7 @@ class GaussianDiffusion(nn.Module):
     def p_sample(
         self,
         x: torch.Tensor,
-        t: int,
+        t_tensor: torch.Tensor,
         t_index: int,
         condition: torch.Tensor
     ) -> torch.Tensor:
@@ -222,23 +224,17 @@ class GaussianDiffusion(nn.Module):
         
         Args:
             x: 当前状态 x_t [B, 1, 2048]
-            t: 时间步标量
-            t_index: 时间步索引（用于提取系数）
+            t_tensor: 时间步张量 [B] (预先创建好)
+            t_index: 时间步索引
             condition: 条件信号 [B, 1, 2048]
             
         Returns:
             x_{t-1}: 去噪后的信号 [B, 1, 2048]
         """
-        batch_size = x.shape[0]
-        device = x.device
-        
-        # 创建时间步张量
-        t_tensor = torch.full((batch_size,), t, device=device, dtype=torch.long)
-        
         # 预测噪声
         predicted_noise = self.model(x, t_tensor, condition)
         
-        # 提取系数
+        # 提取系数（一次性提取所有需要的系数）
         sqrt_recip_alphas_t = self._extract(self.sqrt_recip_alphas, t_tensor, x.shape)
         betas_t = self._extract(self.betas, t_tensor, x.shape)
         sqrt_one_minus_alphas_cumprod_t = self._extract(
@@ -264,7 +260,9 @@ class GaussianDiffusion(nn.Module):
     def sample(
         self,
         condition: torch.Tensor,
-        return_intermediates: bool = False
+        return_intermediates: bool = False,
+        ddim_sampling: bool = False,
+        show_progress: bool = False
     ) -> torch.Tensor:
         """
         完整的采样过程: 从纯高斯噪声逐步去噪
@@ -272,6 +270,8 @@ class GaussianDiffusion(nn.Module):
         Args:
             condition: 条件信号（raw EEG）[B, 1, 2048]
             return_intermediates: 是否返回中间步骤
+            ddim_sampling: 是否使用DDIM加速采样
+            show_progress: 是否显示进度条（会降低速度）
             
         Returns:
             denoised: 去噪后的干净信号 [B, 1, 2048]
@@ -284,13 +284,33 @@ class GaussianDiffusion(nn.Module):
         # 从纯高斯噪声开始
         x = torch.randn(shape, device=device)
         
+        # 确定采样步数
+        if ddim_sampling and self.sampling_timesteps < self.timesteps:
+            # DDIM: 使用子序列进行采样
+            times = torch.linspace(-1, self.timesteps - 1, self.sampling_timesteps + 1, device=device)
+            times = list(reversed(times.int().tolist()))
+            time_pairs = list(zip(times[:-1], times[1:]))
+        else:
+            # DDPM: 使用所有时间步
+            time_pairs = [(i, i) for i in reversed(range(0, self.timesteps))]
+        
+        # 预创建时间步张量（避免循环中重复创建）
+        t_tensor = torch.zeros(batch_size, dtype=torch.long, device=device)
+        
         intermediates = []
         
-        # 逐步去噪: T -> 0
-        for i in tqdm(reversed(range(0, self.timesteps)), desc='Sampling', total=self.timesteps, leave=False):
-            x = self.p_sample(x, i, i, condition)
+        # 逐步去噪
+        iterator = enumerate(time_pairs)
+        if show_progress:
+            iterator = tqdm(iterator, desc='Sampling', total=len(time_pairs), leave=False)
+        
+        for idx, (t_cur, t_next) in iterator:
+            # 更新时间步张量（原地操作，避免重新分配）
+            t_tensor.fill_(t_cur)
             
-            if return_intermediates and i % 100 == 0:
+            x = self.p_sample(x, t_tensor, idx, condition)
+            
+            if return_intermediates and idx % 100 == 0:
                 intermediates.append(x.cpu())
         
         if return_intermediates:
