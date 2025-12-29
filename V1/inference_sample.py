@@ -1,6 +1,7 @@
 import numpy as np
 
-file_path = 'Dataset/test/raw/test_001_raw.npy'
+file_path = 'dataset/train/clean/train_092_clean.npy'
+# file_path = 'dataset/train/raw/train_092_raw.npy'
 raw_data = np.load(file_path)
 N = 50
 idx_start = 10000
