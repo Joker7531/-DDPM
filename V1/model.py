@@ -151,7 +151,8 @@ class ConditionalDiffWave(nn.Module):
         residual_channels: int = 256,
         num_layers: int = 30,
         dilation_cycle: int = 10,  # [1, 2, 4, ..., 512] 共10个，循环3次
-        time_emb_dim: int = 512
+        time_emb_dim: int = 512,
+        condition_dropout: float = 0.1  # 条件Dropout概率
     ):
         super().__init__()
         
@@ -159,6 +160,7 @@ class ConditionalDiffWave(nn.Module):
         self.out_channels = out_channels
         self.residual_channels = residual_channels
         self.num_layers = num_layers
+        self.condition_dropout = condition_dropout
         
         # 时间步编码
         self.time_pos_emb = SinusoidalPosEmb(time_emb_dim // 2)
@@ -174,6 +176,9 @@ class ConditionalDiffWave(nn.Module):
             residual_channels,
             kernel_size=1
         )
+        
+        # 条件Dropout（在训练时随机丢弃条件信息）
+        self.condition_dropout_layer = nn.Dropout(condition_dropout)
         
         # 构建残差块
         self.residual_layers = nn.ModuleList()
@@ -215,6 +220,9 @@ class ConditionalDiffWave(nn.Module):
         """
         # 拼接噪声信号和条件信号
         if condition is not None:
+            # 在训练时应用条件Dropout
+            if self.training and self.condition_dropout > 0:
+                condition = self.condition_dropout_layer(condition)
             x = torch.cat([x, condition], dim=1)  # [B, 2, 2048]
         
         # 时间步嵌入

@@ -275,7 +275,8 @@ def train(
         residual_channels=256,
         num_layers=30,
         dilation_cycle=10,
-        time_emb_dim=512
+        time_emb_dim=512,
+        condition_dropout=0.1  # 条件Dropout提高鲁棒性
     ).to(device)
     
     diffusion = GaussianDiffusion(

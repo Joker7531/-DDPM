@@ -10,7 +10,12 @@ from typing import Optional, Tuple
 from tqdm import tqdm
 
 from model import ConditionalDiffWave
-from loss import MultiResolutionSTFTLoss
+from loss import (
+    MultiResolutionSTFTLoss,
+    MeanLoss,
+    TotalVariationLoss,
+    GradientDifferenceLoss
+)
 
 
 class GaussianDiffusion(nn.Module):
@@ -44,6 +49,11 @@ class GaussianDiffusion(nn.Module):
         # 创建STFT损失（用于hybrid模式）
         if loss_type in ['stft', 'hybrid']:
             self.stft_loss = MultiResolutionSTFTLoss()
+        
+        # 创建额外的损失函数（防止低频漂移和突变噪声）
+        self.mean_loss = MeanLoss(weight=0.5)  # 均值损失
+        self.tv_loss = TotalVariationLoss(weight=0.01)  # 总变分损失
+        self.grad_loss = GradientDifferenceLoss(weight=0.05)  # 梯度损失
         
         # 定义beta schedule (线性调度)
         betas = torch.linspace(beta_start, beta_end, timesteps)
@@ -190,18 +200,32 @@ class GaussianDiffusion(nn.Module):
             loss_dict['stft_total'] = stft_loss.item()
             
         elif self.loss_type == 'hybrid':
-            # 混合损失: L1 + STFT
+            # 混合损失: L1 + STFT + Mean + TV + Gradient
             noise_loss = F.l1_loss(predicted_noise, noise)
             
             # 从预测的噪声反推x_0
             x_0_pred = self.predict_x0_from_noise(x_noisy, t, predicted_noise)
             stft_loss, stft_dict = self.stft_loss(x_0_pred, x_start)
             
+            # 额外的正则化损失
+            mean_loss_val = self.mean_loss(x_0_pred)
+            tv_loss_val = self.tv_loss(x_0_pred)
+            grad_loss_val = self.grad_loss(x_0_pred, x_start)
+            
             # 加权组合
-            total_loss = noise_loss + 0.1 * stft_loss  # STFT loss权重可调
+            total_loss = (
+                noise_loss + 
+                0.1 * stft_loss + 
+                mean_loss_val + 
+                tv_loss_val + 
+                grad_loss_val
+            )
             
             loss_dict['noise_l1'] = noise_loss.item()
             loss_dict['stft_total'] = stft_loss.item()
+            loss_dict['mean_loss'] = mean_loss_val.item()
+            loss_dict['tv_loss'] = tv_loss_val.item()
+            loss_dict['grad_loss'] = grad_loss_val.item()
             loss_dict.update(stft_dict)
             
         else:

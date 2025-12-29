@@ -128,6 +128,87 @@ class MultiResolutionSTFTLoss(nn.Module):
         return avg_loss, loss_dict
 
 
+class MeanLoss(nn.Module):
+    """
+    均值损失：惩罚重建信号的均值偏离零点
+    防止低频漂移和积分误差累积
+    """
+    
+    def __init__(self, weight: float = 1.0):
+        super().__init__()
+        self.weight = weight
+    
+    def forward(self, y_pred: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            y_pred: 预测信号 [B, 1, T]
+            
+        Returns:
+            loss: 均值损失
+        """
+        # 计算每个样本的均值，然后取绝对值平均
+        mean_values = torch.mean(y_pred, dim=-1)  # [B, 1]
+        loss = torch.mean(torch.abs(mean_values))
+        
+        return self.weight * loss
+
+
+class TotalVariationLoss(nn.Module):
+    """
+    总变分损失：平滑信号，抑制突变噪声
+    计算信号的一阶差分的L1范数
+    """
+    
+    def __init__(self, weight: float = 1.0):
+        super().__init__()
+        self.weight = weight
+    
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            y: 输入信号 [B, 1, T]
+            
+        Returns:
+            loss: 总变分损失
+        """
+        # 计算一阶差分
+        diff = y[:, :, 1:] - y[:, :, :-1]  # [B, 1, T-1]
+        
+        # L1范数
+        tv_loss = torch.mean(torch.abs(diff))
+        
+        return self.weight * tv_loss
+
+
+class GradientDifferenceLoss(nn.Module):
+    """
+    梯度差异损失：确保预测信号的梯度接近真值
+    有助于保持信号的时间动态特性
+    """
+    
+    def __init__(self, weight: float = 1.0):
+        super().__init__()
+        self.weight = weight
+    
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            y_pred: 预测信号 [B, 1, T]
+            y_true: 真实信号 [B, 1, T]
+            
+        Returns:
+            loss: 梯度差异损失
+        """
+        # 计算梯度（一阶差分）
+        grad_pred = y_pred[:, :, 1:] - y_pred[:, :, :-1]
+        grad_true = y_true[:, :, 1:] - y_true[:, :, :-1]
+        
+        # L1损失
+        grad_loss = torch.mean(torch.abs(grad_pred - grad_true))
+        
+        return self.weight * grad_loss
+
+
 if __name__ == "__main__":
     # 测试代码
     batch_size = 4
@@ -147,3 +228,18 @@ if __name__ == "__main__":
     print("\nPer-resolution losses:")
     for key, value in loss_dict.items():
         print(f"  {key}: {value:.6f}")
+    
+    # 测试均值损失
+    mean_loss_fn = MeanLoss(weight=1.0)
+    mean_loss = mean_loss_fn(y_pred)
+    print(f"\nMean Loss: {mean_loss.item():.6f}")
+    
+    # 测试总变分损失
+    tv_loss_fn = TotalVariationLoss(weight=0.01)
+    tv_loss = tv_loss_fn(y_pred)
+    print(f"Total Variation Loss: {tv_loss.item():.6f}")
+    
+    # 测试梯度差异损失
+    grad_loss_fn = GradientDifferenceLoss(weight=0.1)
+    grad_loss = grad_loss_fn(y_pred, y_true)
+    print(f"Gradient Difference Loss: {grad_loss.item():.6f}")

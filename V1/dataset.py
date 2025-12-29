@@ -66,6 +66,7 @@ class EEGDataset(Dataset):
         """
         Instance Normalization
         使用raw信号的统计量归一化raw和clean
+        并显式强制均值为零，防止DC漂移
         
         Args:
             raw_segment: raw信号片段 [T]
@@ -86,6 +87,10 @@ class EEGDataset(Dataset):
         # 归一化
         normalized_raw = (raw_segment - mean) / std
         normalized_clean = (clean_segment - mean) / std
+        
+        # 显式强制去除DC分量（确保均值为零）
+        normalized_raw = normalized_raw - np.mean(normalized_raw)
+        normalized_clean = normalized_clean - np.mean(normalized_clean)
         
         return normalized_raw, normalized_clean
     
