@@ -155,8 +155,7 @@ class Trainer:
             self.optimizer,
             mode='min',
             factor=0.5,
-            patience=config.get('scheduler_patience', 10),
-            verbose=True
+            patience=config.get('scheduler_patience', 10)
         )
         
         # Setup logging
@@ -419,7 +418,7 @@ def main():
         
         # Device
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-        'num_workers': -1
+        'num_workers': 6
     }
     
     # Create datasets
