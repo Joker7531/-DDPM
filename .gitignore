@@ -4,6 +4,7 @@ output_V2/
 logs/
 checkpoints/
 Dataset/
+Dataset_STFT/
 __pycache__/
 
 *.pyc
