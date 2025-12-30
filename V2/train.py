@@ -223,7 +223,7 @@ class Trainer:
             Dict[str, float]: Average training metrics
         """
         self.model.train()
-        epoch_losses = {'total': [], 'mse': [], 'l1': []}
+        epoch_losses = {'total': [], 'l1_real_imag': [], 'log_magnitude': []}
         
         pbar = tqdm(self.train_loader, desc=f'Epoch {self.current_epoch + 1} [Train]')
         
@@ -289,7 +289,7 @@ class Trainer:
             Dict[str, float]: Average validation metrics
         """
         self.model.eval()
-        epoch_losses = {'total': [], 'mse': [], 'l1': []}
+        epoch_losses = {'total': [], 'l1_real_imag': [], 'log_magnitude': []}
         
         pbar = tqdm(self.val_loader, desc=f'Epoch {self.current_epoch + 1} [Val]')
         
