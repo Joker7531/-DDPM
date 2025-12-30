@@ -57,24 +57,34 @@ class EEGSTFTDataset(Dataset):
         self.nfft = nfft if nfft is not None else nperseg
         self.transform = transform
         
-        # Load metadata
-        metadata_path = self.root_dir / metadata_file
-        if not metadata_path.exists():
-            raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
+        # Find all raw files in the split directory
+        raw_dir = self.root_dir / split / 'raw'
+        clean_dir = self.root_dir / split / 'clean'
         
-        self.metadata = pd.read_csv(metadata_path)
+        if not raw_dir.exists():
+            raise FileNotFoundError(f"Raw directory not found: {raw_dir}")
+        if not clean_dir.exists():
+            raise FileNotFoundError(f"Clean directory not found: {clean_dir}")
         
-        # Filter by split
-        self.data_info = self.metadata[self.metadata['split'] == split].reset_index(drop=True)
+        # Get all raw files
+        self.raw_files = sorted(list(raw_dir.glob('*_raw.npy')))
         
-        if len(self.data_info) == 0:
-            raise ValueError(f"No data found for split '{split}'")
+        if len(self.raw_files) == 0:
+            raise ValueError(f"No raw files found in {raw_dir}")
         
-        print(f"Loaded {len(self.data_info)} samples for split '{split}'")
+        # Verify matching clean files exist
+        self.clean_files = []
+        for raw_file in self.raw_files:
+            clean_file = clean_dir / raw_file.name.replace('_raw.npy', '_clean.npy')
+            if not clean_file.exists():
+                raise FileNotFoundError(f"Matching clean file not found: {clean_file}")
+            self.clean_files.append(clean_file)
+        
+        print(f"Loaded {len(self.raw_files)} samples for split '{split}'")
     
     def __len__(self) -> int:
         """Return the total number of samples."""
-        return len(self.data_info)
+        return len(self.raw_files)
     
     def _compute_stft(self, signal_data: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -115,13 +125,9 @@ class EEGSTFTDataset(Dataset):
                 - raw_stft: Raw signal STFT [2, Freq, Time]
                 - clean_stft: Clean signal STFT [2, Freq, Time]
         """
-        # Get file information
-        row = self.data_info.iloc[idx]
-        filename = row['filename']
-        
-        # Construct file paths
-        raw_path = self.root_dir / self.split / 'raw' / f"{filename}_raw.npy"
-        clean_path = self.root_dir / self.split / 'clean' / f"{filename}_clean.npy"
+        # Get file paths
+        raw_path = self.raw_files[idx]
+        clean_path = self.clean_files[idx]
         
         # Load signals
         raw_signal = np.load(raw_path)
