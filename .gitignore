@@ -1,6 +1,5 @@
 results/
-output/
-output_V2/
+output*/
 logs/
 checkpoints/
 Dataset/
