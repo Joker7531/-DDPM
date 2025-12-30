@@ -251,6 +251,11 @@ class Trainer:
             
             self.optimizer.step()
             
+            # Clear gradients and cache
+            self.optimizer.zero_grad(set_to_none=True)
+            if (batch_idx + 1) % 10 == 0:
+                torch.cuda.empty_cache()
+            
             # Log
             for key, value in loss_dict.items():
                 epoch_losses[key].append(value)
@@ -441,7 +446,7 @@ def main():
         'hop_length': 64,
         
         # Training
-        'batch_size': 64,
+        'batch_size': 4,
         'num_epochs': 200,
         'learning_rate': 1e-4,
         'weight_decay': 1e-5,
@@ -461,7 +466,7 @@ def main():
         
         # Device
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-        'num_workers': 6
+        'num_workers': 0
     }
     
     # Create datasets
@@ -489,7 +494,7 @@ def main():
         batch_size=config['batch_size'],
         shuffle=True,
         num_workers=config['num_workers'],
-        pin_memory=True,
+        pin_memory=False,
         collate_fn=collate_fn_pad
     )
     
@@ -498,7 +503,7 @@ def main():
         batch_size=config['batch_size'],
         shuffle=False,
         num_workers=config['num_workers'],
-        pin_memory=True,
+        pin_memory=False,
         collate_fn=collate_fn_pad
     )
     
@@ -518,8 +523,8 @@ def main():
         val_loader=val_loader,
         config=config,
         device=config['device'],
-        checkpoint_dir='./checkpoints_V2',
-        log_dir='./logs_V2'
+        checkpoint_dir='./output_V2/checkpoints_V2',
+        log_dir='./output_V2/logs_V2'
     )
     
     # Start training
