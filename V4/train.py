@@ -28,7 +28,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
 # 导入自定义模块
 from dataset import STFTSlicingDataset, get_dataloaders
@@ -158,7 +158,7 @@ class Trainer:
         
         # 混合精度训练
         self.use_amp = config.get('use_amp', True) and torch.cuda.is_available()
-        self.scaler = GradScaler() if self.use_amp else None
+        self.scaler = GradScaler(device='cuda') if self.use_amp else None
         
         # PSNR 指标
         self.psnr_metric = PSNRMetric()
@@ -199,7 +199,7 @@ class Trainer:
             
             # 前向传播 (混合精度)
             if self.use_amp:
-                with autocast():
+                with autocast(device_type='cuda'):
                     # 预测噪声
                     noise_pred = self.model(raw_norm)
                     
@@ -304,7 +304,7 @@ class Trainer:
             
             # 前向传播
             if self.use_amp:
-                with autocast():
+                with autocast(device_type='cuda'):
                     noise_pred = self.model(raw_norm)
                     loss, loss_dict = self.criterion(
                         noise_pred=noise_pred,

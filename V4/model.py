@@ -343,20 +343,27 @@ class SpectrogramNAFNet(nn.Module):
         )
         
         # 解码器
+        # 解码器从瓶颈层开始，通道数为 channels (最大通道数)
+        # 结构: decoder -> upsample -> concat skip -> fusion -> decoder -> ...
         self.ups = nn.ModuleList()
         self.fusions = nn.ModuleList()
         self.decoders = nn.ModuleList()
         
-        for i in range(len(num_blocks) - 1, -1, -1):
-            if i > 0:
-                # 上采样
-                self.ups.append(Upsample(channels))
-                channels //= 2
-                
-                # 融合卷积 (处理 skip connection)
-                self.fusions.append(
-                    nn.Conv2d(channels * 2, channels, kernel_size=1)
-                )
+        # 第一个decoder处理瓶颈层输出，通道数不变
+        self.decoders.append(nn.Sequential(
+            *[NAFBlock(channels, dropout_rate) for _ in range(num_blocks[-1])]
+        ))
+        
+        # 后续 decoder: upsample + skip concat + fusion + NAFBlocks
+        for i in range(len(num_blocks) - 2, -1, -1):
+            # 上采样 (通道数减半)
+            self.ups.append(Upsample(channels))
+            channels //= 2
+            
+            # 融合卷积 (处理 skip connection: concat后通道数翻倍)
+            self.fusions.append(
+                nn.Conv2d(channels * 2, channels, kernel_size=1)
+            )
             
             # NAFBlock 堆叠
             decoder_blocks = nn.Sequential(
@@ -455,16 +462,20 @@ class SpectrogramNAFNet(nn.Module):
         x = self.bottleneck(x)
         
         # 5. 解码器
-        for i, decoder in enumerate(self.decoders):
-            if i > 0:
-                # 上采样
-                x = self.ups[i - 1](x)
-                # Skip connection
-                skip = skip_connections[-(i)]
-                x = torch.cat([x, skip], dim=1)
-                # 融合
-                x = self.fusions[i - 1](x)
-            x = decoder(x)
+        # 第一个decoder处理瓶颈层输出
+        x = self.decoders[0](x)
+        
+        # 后续decoder: upsample -> concat skip -> fusion -> decoder
+        for i in range(len(self.ups)):
+            # 上采样
+            x = self.ups[i](x)
+            # Skip connection (逆序取skip)
+            skip = skip_connections[-(i + 1)]
+            x = torch.cat([x, skip], dim=1)
+            # 融合
+            x = self.fusions[i](x)
+            # Decoder blocks
+            x = self.decoders[i + 1](x)
         
         # 6. 输出投影
         x = self.outro(x)
