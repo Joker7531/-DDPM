@@ -38,7 +38,15 @@ def collate_fn_pad(batch):
     raw_stfts, clean_stfts = zip(*batch)
     
     # Find maximum time dimension
-    max_time = max(r.shape[-1] for r in raw_stfts)
+    time_dims = [r.shape[-1] for r in raw_stfts]
+    max_time = max(time_dims)
+    min_time = min(time_dims)
+    
+    # Diagnostic: Print padding info (only occasionally)
+    if np.random.random() < 0.05:  # 5% chance to print
+        print(f"\n[Collate] Batch size: {len(batch)}, Time range: [{min_time}, {max_time}], Pad to: {max_time}")
+        padding_waste = sum(max_time - t for t in time_dims) / (max_time * len(batch)) * 100
+        print(f"[Collate] Padding waste: {padding_waste:.1f}%")
     
     # Pad all tensors to max_time
     padded_raw = []
@@ -228,19 +236,39 @@ class Trainer:
         pbar = tqdm(self.train_loader, desc=f'Epoch {self.current_epoch + 1} [Train]')
         
         for batch_idx, (raw_stft, clean_stft) in enumerate(pbar):
+            # Diagnostic: Monitor batch and memory (first few batches)
+            if batch_idx < 3:
+                print(f"\n[Batch {batch_idx}] Input shape: {list(raw_stft.shape)}")
+                print(f"[Batch {batch_idx}] Tensor size: {raw_stft.numel()*4/1024/1024:.2f} MB")
+                if torch.cuda.is_available():
+                    print(f"[Batch {batch_idx}] GPU memory before forward: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+            
             # Move to device
             raw_stft = raw_stft.to(self.device)
             clean_stft = clean_stft.to(self.device)
+            
+            if batch_idx < 3 and torch.cuda.is_available():
+                print(f"[Batch {batch_idx}] GPU memory after to(device): {torch.cuda.memory_allocated()/1024**3:.2f} GB")
             
             # Forward pass
             self.optimizer.zero_grad()
             pred_stft = self.model(raw_stft)
             
+            if batch_idx < 3 and torch.cuda.is_available():
+                print(f"[Batch {batch_idx}] GPU memory after forward: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+                print(f"[Batch {batch_idx}] Output shape: {list(pred_stft.shape)}")
+            
             # Compute loss
             loss, loss_dict = self.criterion(pred_stft, clean_stft)
             
+            if batch_idx < 3 and torch.cuda.is_available():
+                print(f"[Batch {batch_idx}] GPU memory after loss: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+            
             # Backward pass
             loss.backward()
+            
+            if batch_idx < 3 and torch.cuda.is_available():
+                print(f"[Batch {batch_idx}] GPU memory after backward: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
             
             # Gradient clipping (optional)
             if self.config.get('grad_clip', None):
@@ -480,6 +508,36 @@ def main():
         root_dir=config['dataset_root'],
         split='val'
     )
+    
+    # ========== DIAGNOSTIC: Check data shapes ==========
+    print("\n" + "="*70)
+    print("DIAGNOSTIC: Dataset Shape Analysis")
+    print("="*70)
+    
+    time_dims = []
+    freq_dims = []
+    print("\nSampling first 10 training samples...")
+    for i in range(min(10, len(train_dataset))):
+        raw, clean = train_dataset[i]
+        time_dims.append(raw.shape[-1])
+        freq_dims.append(raw.shape[-2])
+        print(f"  Sample {i}: shape={list(raw.shape)}, size={raw.numel()*4/1024/1024:.2f} MB")
+    
+    print(f"\nTime dimension statistics:")
+    print(f"  Min:    {min(time_dims)}")
+    print(f"  Max:    {max(time_dims)}")
+    print(f"  Mean:   {np.mean(time_dims):.1f}")
+    print(f"  Median: {np.median(time_dims):.1f}")
+    
+    if max(time_dims) > min(time_dims) * 2:
+        print(f"\n⚠️  WARNING: Large variation in time dimension!")
+        print(f"     Shortest: {min(time_dims)}, Longest: {max(time_dims)}")
+        print(f"     Ratio: {max(time_dims)/min(time_dims):.1f}x")
+        print(f"     This will cause excessive padding in batches!")
+    
+    print(f"\nFrequency dimension: {freq_dims[0]} (should be consistent)")
+    print("="*70 + "\n")
+    # ====================================================
     
     # Create data loaders
     train_loader = DataLoader(
