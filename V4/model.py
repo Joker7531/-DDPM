@@ -373,6 +373,31 @@ class SpectrogramNAFNet(nn.Module):
         
         # 输出投影
         self.outro = nn.Conv2d(base_channels, out_channels, kernel_size=3, padding=1)
+        
+        # 初始化权重
+        self._initialize_weights()
+    
+    def _initialize_weights(self) -> None:
+        """
+        初始化网络权重
+        
+        使用 Kaiming 初始化卷积层，零初始化输出层，
+        以确保训练初期输出接近零（对于残差学习很重要）
+        """
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                # Kaiming 初始化（适用于无激活函数的网络）
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='linear')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='linear')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        
+        # 输出层使用更小的初始化（残差学习关键）
+        nn.init.zeros_(self.outro.weight)
+        nn.init.zeros_(self.outro.bias)
     
     def _pad_to_divisible(
         self,

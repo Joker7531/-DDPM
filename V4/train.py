@@ -169,6 +169,29 @@ class Trainer:
         
         # 当前 epoch
         self.current_epoch = 0
+        
+        # Warmup 参数
+        self.warmup_epochs = config.get('warmup_epochs', 5)
+        self.base_lr = config.get('lr', 1e-4)
+    
+    def _get_warmup_lr(self, epoch: int, batch_idx: int, num_batches: int) -> float:
+        """
+        计算 warmup 期间的学习率
+        
+        Args:
+            epoch: 当前 epoch
+            batch_idx: 当前 batch 索引
+            num_batches: 每 epoch 的 batch 总数
+            
+        Returns:
+            当前学习率
+        """
+        if epoch >= self.warmup_epochs:
+            return self.base_lr
+        
+        # 线性 warmup
+        progress = (epoch * num_batches + batch_idx) / (self.warmup_epochs * num_batches)
+        return self.base_lr * progress
     
     def train_epoch(self) -> Dict[str, float]:
         """
@@ -229,8 +252,10 @@ class Trainer:
                 
                 # 检查梯度是否有效
                 if not torch.isfinite(grad_norm):
-                    self.logger.warning(f"检测到梯度爆炸 (grad_norm={grad_norm:.4f})，跳过此batch")
+                    self.logger.warning(f"检测到梯度爆炸 (grad_norm=inf)，跳过此batch")
                     self.optimizer.zero_grad()
+                    # 必须调用update()以重置scaler状态
+                    self.scaler.update()
                     continue
                 
                 # 更新参数
@@ -272,8 +297,15 @@ class Trainer:
                 # 更新参数
                 self.optimizer.step()
             
-            # 更新学习率
-            self.scheduler.step(self.current_epoch + batch_idx / num_batches)
+            # 更新学习率 (warmup 或正常调度)
+            if self.current_epoch < self.warmup_epochs:
+                # Warmup 期间使用线性增长的学习率
+                warmup_lr = self._get_warmup_lr(self.current_epoch, batch_idx, num_batches)
+                for param_group in self.optimizer.param_groups:
+                    param_group['lr'] = warmup_lr
+            else:
+                # Warmup 结束后使用 CosineAnnealing
+                self.scheduler.step(self.current_epoch - self.warmup_epochs + batch_idx / num_batches)
             
             # 更新统计
             batch_size = raw_norm.size(0)
@@ -535,12 +567,16 @@ def main():
         help='批次大小'
     )
     parser.add_argument(
-        '--lr', type=float, default=1e-3,
-        help='学习率'
+        '--lr', type=float, default=1e-4,
+        help='学习率 (默认 1e-4)'
     )
     parser.add_argument(
         '--weight_decay', type=float, default=1e-2,
         help='权重衰减'
+    )
+    parser.add_argument(
+        '--warmup_epochs', type=int, default=5,
+        help='学习率预热轮数'
     )
     parser.add_argument(
         '--num_workers', type=int, default=4,
@@ -622,6 +658,7 @@ def main():
         'batch_size': args.batch_size,
         'lr': args.lr,
         'weight_decay': args.weight_decay,
+        'warmup_epochs': args.warmup_epochs,
         'num_workers': args.num_workers,
         'base_channels': args.base_channels,
         'dropout': args.dropout,

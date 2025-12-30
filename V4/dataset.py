@@ -188,6 +188,18 @@ class STFTSlicingDataset(Dataset):
         raw_slice = raw_slice[:, self.freq_start:self.freq_end, :]    # [2, 103, 156]
         clean_slice = clean_slice[:, self.freq_start:self.freq_end, :]
         
+        # 数据验证和清洗
+        # 处理 NaN 和 Inf
+        if not np.isfinite(raw_slice).all():
+            raw_slice = np.nan_to_num(raw_slice, nan=0.0, posinf=0.0, neginf=0.0)
+        if not np.isfinite(clean_slice).all():
+            clean_slice = np.nan_to_num(clean_slice, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # 限制极端值 (防止数值溢出)
+        max_val = 1e6
+        raw_slice = np.clip(raw_slice, -max_val, max_val)
+        clean_slice = np.clip(clean_slice, -max_val, max_val)
+        
         return raw_slice, clean_slice
     
     def _compute_magnitude(self, data: np.ndarray) -> np.ndarray:
@@ -314,12 +326,27 @@ class STFTSlicingDataset(Dataset):
             noise_norm = np.nan_to_num(noise_norm, nan=0.0, posinf=0.0, neginf=0.0)
         
         # 转换为PyTorch张量
+        input_tensor = torch.from_numpy(raw_norm).float()
+        target_tensor = torch.from_numpy(noise_norm).float()
+        clean_tensor = torch.from_numpy(clean_norm).float()
+        
+        # 最终安全检查：限制输出值域防止梯度爆炸
+        max_output_val = 10.0  # 归一化后数据应该在合理范围内
+        input_tensor = torch.clamp(input_tensor, -max_output_val, max_output_val)
+        target_tensor = torch.clamp(target_tensor, -max_output_val, max_output_val)
+        clean_tensor = torch.clamp(clean_tensor, -max_output_val, max_output_val)
+        
+        # 替换任何残留的 NaN/Inf
+        input_tensor = torch.nan_to_num(input_tensor, nan=0.0, posinf=0.0, neginf=0.0)
+        target_tensor = torch.nan_to_num(target_tensor, nan=0.0, posinf=0.0, neginf=0.0)
+        clean_tensor = torch.nan_to_num(clean_tensor, nan=0.0, posinf=0.0, neginf=0.0)
+        
         return {
-            'input': torch.from_numpy(raw_norm).float(),      # [2, 103, 156]
-            'target': torch.from_numpy(noise_norm).float(),   # [2, 103, 156]
+            'input': input_tensor,      # [2, 103, 156]
+            'target': target_tensor,    # [2, 103, 156]
             'mean': torch.tensor(raw_mean).float(),
             'std': torch.tensor(raw_std).float(),
-            'clean_norm': torch.from_numpy(clean_norm).float()  # [2, 103, 156]
+            'clean_norm': clean_tensor  # [2, 103, 156]
         }
 
 
