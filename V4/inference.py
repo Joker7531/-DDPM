@@ -558,7 +558,7 @@ def main():
         help='STFT的FFT点数'
     )
     parser.add_argument(
-        '--hop_length', type=int, default=128,
+        '--hop_length', type=int, default=64,
         help='STFT的跳跃长度'
     )
     parser.add_argument(
