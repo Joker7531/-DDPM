@@ -24,6 +24,49 @@ from model import SpectrogramUNet
 from dataset import EEGSTFTDataset
 
 
+def collate_fn_pad(batch):
+    """
+    Custom collate function to handle variable-length STFT sequences.
+    Pads all samples to the maximum time dimension in the batch.
+    
+    Args:
+        batch: List of (raw_stft, clean_stft) tuples
+        
+    Returns:
+        Tuple of batched and padded tensors
+    """
+    raw_stfts, clean_stfts = zip(*batch)
+    
+    # Find maximum time dimension
+    max_time = max(r.shape[-1] for r in raw_stfts)
+    
+    # Pad all tensors to max_time
+    padded_raw = []
+    padded_clean = []
+    
+    for raw, clean in zip(raw_stfts, clean_stfts):
+        # Get current time dimension
+        curr_time = raw.shape[-1]
+        pad_amount = max_time - curr_time
+        
+        if pad_amount > 0:
+            # Pad on the right (last dimension)
+            raw_padded = torch.nn.functional.pad(raw, (0, pad_amount))
+            clean_padded = torch.nn.functional.pad(clean, (0, pad_amount))
+        else:
+            raw_padded = raw
+            clean_padded = clean
+        
+        padded_raw.append(raw_padded)
+        padded_clean.append(clean_padded)
+    
+    # Stack into batch
+    raw_batch = torch.stack(padded_raw, dim=0)
+    clean_batch = torch.stack(padded_clean, dim=0)
+    
+    return raw_batch, clean_batch
+
+
 class CompositeLoss(nn.Module):
     """
     Composite Loss for Complex STFT Spectrogram Reconstruction.
@@ -446,7 +489,8 @@ def main():
         batch_size=config['batch_size'],
         shuffle=True,
         num_workers=config['num_workers'],
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=collate_fn_pad
     )
     
     val_loader = DataLoader(
@@ -454,7 +498,8 @@ def main():
         batch_size=config['batch_size'],
         shuffle=False,
         num_workers=config['num_workers'],
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=collate_fn_pad
     )
     
     # Create model
