@@ -21,7 +21,7 @@ import json
 from datetime import datetime
 
 from model import SpectrogramUNet
-from dataset import EEGSTFTDataset
+from dataset import PrecomputedSTFTDataset
 
 
 def collate_fn_pad(batch):
@@ -440,10 +440,10 @@ def main():
         'depth': 4,
         
         # Dataset
-        'dataset_root': 'Dataset',
+        'dataset_root': 'Dataset_STFT',  # Precomputed STFT directory
         'fs': 500,
-        'n_fft': 512,
-        'hop_length': 64,
+        'n_fft': 256,
+        'hop_length': 32,
         
         # Training
         'batch_size': 4,
@@ -471,21 +471,14 @@ def main():
     
     # Create datasets
     print("Loading datasets...")
-    train_dataset = EEGSTFTDataset(
+    train_dataset = PrecomputedSTFTDataset(
         root_dir=config['dataset_root'],
-        split='train',
-        fs=config['fs'],
-        noverlap=config['n_fft'] - config['hop_length'],
-        nfft=config['n_fft']
+        split='train'
     )
     
-    val_dataset = EEGSTFTDataset(
+    val_dataset = PrecomputedSTFTDataset(
         root_dir=config['dataset_root'],
-        split='val',
-        fs=config['fs'],
-        nperseg=config['n_fft'],
-        noverlap=config['n_fft'] - config['hop_length'],
-        nfft=config['n_fft']
+        split='val'
     )
     
     # Create data loaders
