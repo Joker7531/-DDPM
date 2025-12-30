@@ -470,12 +470,12 @@ class Trainer:
             self.save_checkpoint(is_best=is_best)
             
             # 定期保存
-            save_interval = self.config.get('save_interval', 10)
-            if (epoch + 1) % save_interval == 0:
-                self.save_checkpoint(
-                    is_best=False,
-                    filename=f'checkpoint_epoch_{epoch+1}.pth'
-                )
+            # save_interval = self.config.get('save_interval', 10)
+            # if (epoch + 1) % save_interval == 0:
+            #     self.save_checkpoint(
+            #         is_best=False,
+            #         filename=f'checkpoint_epoch_{epoch+1}.pth'
+            #     )
         
         self.logger.info("=" * 60)
         self.logger.info("训练完成!")
@@ -493,21 +493,17 @@ def main():
     
     # 数据参数
     parser.add_argument(
-        '--raw_dir', type=str, required=True,
-        help='原始数据目录 (包含 train/val/test 子目录)'
+        '--data_dir', type=str, default='Dataset_STFT',
+        help='数据基础目录 (包含 train/val/test 子目录, 每个下有 raw/clean 子目录)'
     )
     parser.add_argument(
-        '--clean_dir', type=str, required=True,
-        help='干净数据目录 (包含 train/val/test 子目录)'
-    )
-    parser.add_argument(
-        '--output_dir', type=str, default='outputs',
+        '--output_dir', type=str, default='./output_V4',
         help='输出目录'
     )
     
     # 训练参数
     parser.add_argument(
-        '--epochs', type=int, default=100,
+        '--epochs', type=int, default=200,
         help='训练轮数'
     )
     parser.add_argument(
@@ -596,8 +592,7 @@ def main():
     
     # 配置
     config = {
-        'raw_dir': args.raw_dir,
-        'clean_dir': args.clean_dir,
+        'data_dir': args.data_dir,
         'output_dir': args.output_dir,
         'epochs': args.epochs,
         'batch_size': args.batch_size,
@@ -619,8 +614,7 @@ def main():
     
     # 数据加载器
     train_loader, val_loader, test_loader = get_dataloaders(
-        raw_base_dir=args.raw_dir,
-        clean_base_dir=args.clean_dir,
+        data_base_dir=args.data_dir,
         batch_size=args.batch_size,
         num_workers=args.num_workers
     )

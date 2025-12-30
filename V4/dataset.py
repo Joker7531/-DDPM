@@ -281,8 +281,7 @@ class STFTSlicingDataset(Dataset):
 
 
 def get_dataloaders(
-    raw_base_dir: Union[str, Path],
-    clean_base_dir: Union[str, Path],
+    data_base_dir: Union[str, Path],
     batch_size: int = 32,
     num_workers: int = 4,
     train_stride: int = 40,
@@ -292,9 +291,22 @@ def get_dataloaders(
     """
     获取训练、验证和测试数据加载器
     
+    支持两种目录结构：
+    
+    结构1（推荐）:
+        data_base_dir/
+        ├── train/
+        │   ├── raw/        # npy文件
+        │   └── clean/      # npy文件
+        ├── val/
+        │   ├── raw/
+        │   └── clean/
+        └── test/
+            ├── raw/
+            └── clean/
+    
     Args:
-        raw_base_dir: 原始数据基础目录（包含train/val/test子目录）
-        clean_base_dir: 干净数据基础目录（包含train/val/test子目录）
+        data_base_dir: 数据基础目录（包含train/val/test子目录，每个下有raw/clean）
         batch_size: 批次大小
         num_workers: 数据加载工作进程数
         train_stride: 训练集滑动步长
@@ -304,29 +316,28 @@ def get_dataloaders(
     Returns:
         (train_loader, val_loader, test_loader): 三个数据加载器
     """
-    raw_base = Path(raw_base_dir)
-    clean_base = Path(clean_base_dir)
+    data_base = Path(data_base_dir)
     
     # 创建数据集
     train_dataset = STFTSlicingDataset(
-        raw_dir=raw_base / 'train',
-        clean_dir=clean_base / 'train',
+        raw_dir=data_base / 'train' / 'raw',
+        clean_dir=data_base / 'train' / 'clean',
         mode='train',
         train_stride=train_stride,
         eval_stride=eval_stride
     )
     
     val_dataset = STFTSlicingDataset(
-        raw_dir=raw_base / 'val',
-        clean_dir=clean_base / 'val',
+        raw_dir=data_base / 'val' / 'raw',
+        clean_dir=data_base / 'val' / 'clean',
         mode='val',
         train_stride=train_stride,
         eval_stride=eval_stride
     )
     
     test_dataset = STFTSlicingDataset(
-        raw_dir=raw_base / 'test',
-        clean_dir=clean_base / 'test',
+        raw_dir=data_base / 'test' / 'raw',
+        clean_dir=data_base / 'test' / 'clean',
         mode='test',
         train_stride=train_stride,
         eval_stride=eval_stride
