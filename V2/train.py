@@ -442,11 +442,11 @@ def main():
         # Dataset
         'dataset_root': 'Dataset_STFT',  # Precomputed STFT directory
         'fs': 500,
-        'n_fft': 256,
-        'hop_length': 32,
+        'n_fft': 512,
+        'hop_length': 64,
         
         # Training
-        'batch_size': 4,
+        'batch_size': 64,
         'num_epochs': 200,
         'learning_rate': 1e-4,
         'weight_decay': 1e-5,
@@ -466,7 +466,7 @@ def main():
         
         # Device
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-        'num_workers': 0
+        'num_workers': 4
     }
     
     # Create datasets
