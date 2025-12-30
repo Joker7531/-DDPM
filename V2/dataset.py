@@ -155,27 +155,34 @@ class EEGSTFTDataset(Dataset):
 
 class PrecomputedSTFTDataset(Dataset):
     """
-    Dataset for pre-computed STFT spectrograms.
+    Dataset for loading precomputed STFT spectrograms from disk.
     
-    Use this if you want to precompute and save STFT spectrograms
-    to disk for faster training.
-    
-    Args:
-        root_dir (str): Root directory containing precomputed STFT files
-        split (str): Dataset split ('train', 'val', or 'test')
-        transform (Optional[callable]): Optional transform to apply
+    Uses sliding window to extract fixed-length segments from each file,
+    ensuring all data is utilized.
     """
     
     def __init__(
         self,
         root_dir: str,
         split: str = 'train',
-        transform: Optional[callable] = None
+        transform: Optional[Any] = None,
+        segment_length: int = 625,  # ~20s @ hop_length=32, fs=500
+        stride: Optional[int] = None  # If None, uses segment_length (no overlap)
     ):
+        """
+        Args:
+            root_dir (str): Path to the directory containing train/val/test splits
+            split (str): Which split to use ('train', 'val', or 'test')
+            transform (optional): Optional transform to apply to the spectrograms
+            segment_length (int): Number of time frames per segment
+            stride (int): Stride for sliding window. If None, defaults to segment_length
+        """
         super().__init__()
         
         self.root_dir = Path(root_dir) / split
         self.transform = transform
+        self.segment_length = segment_length
+        self.stride = stride if stride is not None else segment_length
         
         # Find all STFT pairs
         self.raw_files = sorted((self.root_dir / 'raw').glob('*.npy'))
@@ -184,27 +191,66 @@ class PrecomputedSTFTDataset(Dataset):
         assert len(self.raw_files) == len(self.clean_files), \
             "Mismatch between number of raw and clean files"
         
-        print(f"Loaded {len(self.raw_files)} precomputed STFT pairs for split '{split}'")
+        # Pre-compute all window indices: (file_idx, start_frame)
+        self.window_indices = []
+        total_frames = 0
+        
+        for file_idx in range(len(self.raw_files)):
+            # Load file to get length
+            stft_data = np.load(self.raw_files[file_idx])
+            _, _, time_len = stft_data.shape
+            total_frames += time_len
+            
+            # Create sliding windows
+            if time_len < segment_length:
+                # If file is shorter than segment, pad it and use as one segment
+                self.window_indices.append((file_idx, 0))
+            else:
+                # Sliding window with stride
+                for start in range(0, time_len - segment_length + 1, self.stride):
+                    self.window_indices.append((file_idx, start))
+        
+        print(f"Loaded {len(self.raw_files)} precomputed STFT files for split '{split}'")
+        print(f"  Segment length: {segment_length} frames (~{segment_length*32/500:.1f}s @ hop=32, fs=500)")
+        print(f"  Stride: {self.stride} frames (~{self.stride*32/500:.1f}s)")
+        print(f"  Total windows: {len(self.window_indices)} (from {total_frames} total frames)")
     
     def __len__(self) -> int:
-        """Return the total number of samples."""
-        return len(self.raw_files)
+        """Return the total number of windowed segments."""
+        return len(self.window_indices)
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Get a single sample from the dataset.
+        Get a windowed segment from the dataset.
         
         Args:
-            idx (int): Index of the sample
+            idx (int): Index of the window
             
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: 
-                - raw_stft: Raw signal STFT [2, Freq, Time]
-                - clean_stft: Clean signal STFT [2, Freq, Time]
+                - raw_stft: Raw signal STFT segment [2, Freq, segment_length]
+                - clean_stft: Clean signal STFT segment [2, Freq, segment_length]
         """
+        # Get file index and start frame for this window
+        file_idx, start_frame = self.window_indices[idx]
+        
         # Load precomputed STFT spectrograms
-        raw_stft = np.load(self.raw_files[idx])
-        clean_stft = np.load(self.clean_files[idx])
+        raw_stft = np.load(self.raw_files[file_idx])
+        clean_stft = np.load(self.clean_files[file_idx])
+        
+        # Extract segment
+        _, _, time_len = raw_stft.shape
+        
+        if time_len < self.segment_length:
+            # Pad if file is shorter than segment length
+            pad_width = ((0, 0), (0, 0), (0, self.segment_length - time_len))
+            raw_stft = np.pad(raw_stft, pad_width, mode='constant')
+            clean_stft = np.pad(clean_stft, pad_width, mode='constant')
+        else:
+            # Extract window
+            end_frame = start_frame + self.segment_length
+            raw_stft = raw_stft[:, :, start_frame:end_frame]
+            clean_stft = clean_stft[:, :, start_frame:end_frame]
         
         # Convert to torch tensors
         raw_stft = torch.from_numpy(raw_stft).float()

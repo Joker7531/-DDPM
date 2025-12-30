@@ -24,13 +24,14 @@ from model import SpectrogramUNet
 from dataset import PrecomputedSTFTDataset
 
 
-def collate_fn_pad(batch):
+def collate_fn_pad(batch, max_time_limit=2000):
     """
     Custom collate function to handle variable-length STFT sequences.
     Pads all samples to the maximum time dimension in the batch.
     
     Args:
         batch: List of (raw_stft, clean_stft) tuples
+        max_time_limit: Maximum allowed time dimension (to prevent OOM)
         
     Returns:
         Tuple of batched and padded tensors
@@ -42,10 +43,27 @@ def collate_fn_pad(batch):
     max_time = max(time_dims)
     min_time = min(time_dims)
     
+    # Apply time limit by cropping
+    if max_time > max_time_limit:
+        print(f"\n⚠️  WARNING: Max time {max_time} exceeds limit {max_time_limit}, cropping...")
+        raw_stfts_cropped = []
+        clean_stfts_cropped = []
+        for raw, clean in zip(raw_stfts, clean_stfts):
+            if raw.shape[-1] > max_time_limit:
+                # Crop from center
+                start = (raw.shape[-1] - max_time_limit) // 2
+                raw = raw[..., start:start+max_time_limit]
+                clean = clean[..., start:start+max_time_limit]
+            raw_stfts_cropped.append(raw)
+            clean_stfts_cropped.append(clean)
+        raw_stfts = raw_stfts_cropped
+        clean_stfts = clean_stfts_cropped
+        max_time = min(max_time, max_time_limit)
+    
     # Diagnostic: Print padding info (only occasionally)
     if np.random.random() < 0.05:  # 5% chance to print
         print(f"\n[Collate] Batch size: {len(batch)}, Time range: [{min_time}, {max_time}], Pad to: {max_time}")
-        padding_waste = sum(max_time - t for t in time_dims) / (max_time * len(batch)) * 100
+        padding_waste = sum(max_time - min(t, max_time_limit) for t in time_dims) / (max_time * len(batch)) * 100
         print(f"[Collate] Padding waste: {padding_waste:.1f}%")
     
     # Pad all tensors to max_time
@@ -474,11 +492,13 @@ def main():
         'hop_length': 64,
         
         # Training
-        'batch_size': 64,
+        'batch_size': 8,
         'num_epochs': 200,
         'learning_rate': 1e-4,
         'weight_decay': 1e-5,
         'grad_clip': 1.0,
+        'segment_length': 625,  # ~20s @ hop_length=32, fs=500Hz
+        'stride': 312,  # ~10s stride, 50% overlap
         
         # Loss
         'l1_weight': 1.0,
@@ -497,16 +517,20 @@ def main():
         'num_workers': 4
     }
     
-    # Create datasets
+    # Create datasets with sliding window
     print("Loading datasets...")
     train_dataset = PrecomputedSTFTDataset(
         root_dir=config['dataset_root'],
-        split='train'
+        split='train',
+        segment_length=config['segment_length'],
+        stride=config.get('stride', config['segment_length'])
     )
     
     val_dataset = PrecomputedSTFTDataset(
         root_dir=config['dataset_root'],
-        split='val'
+        split='val',
+        segment_length=config['segment_length'],
+        stride=config.get('stride', config['segment_length'])
     )
     
     # ========== DIAGNOSTIC: Check data shapes ==========
@@ -539,14 +563,13 @@ def main():
     print("="*70 + "\n")
     # ====================================================
     
-    # Create data loaders
+    # Create data loaders (no need for custom collate_fn now, all segments have same length)
     train_loader = DataLoader(
         train_dataset,
         batch_size=config['batch_size'],
         shuffle=True,
         num_workers=config['num_workers'],
-        pin_memory=False,
-        collate_fn=collate_fn_pad
+        pin_memory=False
     )
     
     val_loader = DataLoader(
@@ -554,8 +577,7 @@ def main():
         batch_size=config['batch_size'],
         shuffle=False,
         num_workers=config['num_workers'],
-        pin_memory=False,
-        collate_fn=collate_fn_pad
+        pin_memory=False
     )
     
     # Create model
