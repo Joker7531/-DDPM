@@ -13,3 +13,6 @@ __pycache__/
 *.pt
 *.jpg
 *.zip
+*.npy
+*.npz
+*.csv

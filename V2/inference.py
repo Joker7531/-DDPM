@@ -201,6 +201,110 @@ class Inferencer:
         
         return pred_stft.cpu()
     
+    @torch.no_grad()
+    def denoise_full_stft(
+        self,
+        raw_stft: np.ndarray,
+        segment_length: int = 625,
+        stride: int = 312,
+        batch_size: int = 8
+    ) -> np.ndarray:
+        """
+        Denoise full STFT using sliding window with overlap-add reconstruction.
+        
+        Args:
+            raw_stft (np.ndarray): Full raw STFT [2, Freq, Time]
+            segment_length (int): Length of each window
+            stride (int): Stride for sliding window
+            batch_size (int): Batch size for inference
+            
+        Returns:
+            np.ndarray: Reconstructed time-domain signal
+        """
+        _, _, time_len = raw_stft.shape
+        
+        # Calculate output signal length (approximate, will be determined by ISTFT)
+        # Each STFT frame corresponds to hop_length samples
+        hop_length = self.nperseg - self.noverlap
+        approx_signal_len = (time_len - 1) * hop_length + self.nperseg
+        
+        # Initialize output signal and weight accumulator for overlap-add
+        output_signal = np.zeros(approx_signal_len, dtype=np.float32)
+        weight_sum = np.zeros(approx_signal_len, dtype=np.float32)
+        
+        # Create Hann window for smooth blending
+        window = np.hanning(segment_length * hop_length)
+        
+        # Generate window indices
+        if time_len < segment_length:
+            # If shorter than segment, process as single segment with padding
+            window_starts = [0]
+        else:
+            window_starts = list(range(0, time_len - segment_length + 1, stride))
+        
+        print(f"\n  Total STFT frames: {time_len}")
+        print(f"  Processing {len(window_starts)} overlapping windows...")
+        print(f"  Window size: {segment_length} frames (~{segment_length*hop_length/self.fs:.1f}s)")
+        print(f"  Stride: {stride} frames (~{stride*hop_length/self.fs:.1f}s)")
+        
+        # Process windows in batches
+        for batch_idx in tqdm(range(0, len(window_starts), batch_size), desc="  Denoising"):
+            batch_starts = window_starts[batch_idx:batch_idx + batch_size]
+            batch_segments = []
+            
+            # Extract segments for batch
+            for start in batch_starts:
+                end = start + segment_length
+                if end <= time_len:
+                    segment = raw_stft[:, :, start:end]
+                else:
+                    # Pad if needed
+                    segment = raw_stft[:, :, start:]
+                    pad_width = ((0, 0), (0, 0), (0, segment_length - segment.shape[2]))
+                    segment = np.pad(segment, pad_width, mode='constant')
+                
+                batch_segments.append(segment)
+            
+            # Convert to tensor and denoise batch
+            batch_tensor = torch.from_numpy(np.stack(batch_segments, axis=0)).float()
+            denoised_batch = self.denoise_stft(batch_tensor).numpy()
+            
+            # Convert each denoised segment to time-domain and overlap-add
+            for i, start in enumerate(batch_starts):
+                # ISTFT to time-domain
+                segment_signal = stft_to_signal(
+                    denoised_batch[i, 0],
+                    denoised_batch[i, 1],
+                    fs=self.fs,
+                    nperseg=self.nperseg,
+                    noverlap=self.noverlap,
+                    nfft=self.nfft
+                )
+                
+                # Calculate position in output signal
+                signal_start = start * hop_length
+                signal_end = signal_start + len(segment_signal)
+                
+                # Ensure we don't exceed output buffer
+                if signal_end > len(output_signal):
+                    signal_end = len(output_signal)
+                    segment_signal = segment_signal[:signal_end - signal_start]
+                
+                # Create appropriate window for this segment
+                seg_window = window[:len(segment_signal)]
+                
+                # Overlap-add with windowing
+                output_signal[signal_start:signal_end] += segment_signal * seg_window
+                weight_sum[signal_start:signal_end] += seg_window
+        
+        # Normalize by accumulated weights
+        valid_mask = weight_sum > 1e-8
+        output_signal[valid_mask] /= weight_sum[valid_mask]
+        
+        print(f"  Reconstructed signal length: {len(output_signal)} samples ({len(output_signal)/self.fs:.2f}s)")
+        
+        return output_signal
+    
     def denoise_signal(self, raw_signal: np.ndarray) -> np.ndarray:
         """
         Denoise time-domain signal.
@@ -386,26 +490,33 @@ def main():
     
     # Check if input is a single .npy file or a directory
     if data_path.is_file() and data_path.suffix == '.npy':
-        # Single file inference
-        print(f"\nProcessing single file: {data_path}")
+        # Single file inference with sliding window + overlap-add
+        print(f"\n{'='*70}")
+        print(f"Processing single file: {data_path.name}")
+        print(f"{'='*70}")
         
         # Load STFT
         raw_stft = np.load(data_path)
-        print(f"  Input shape: {raw_stft.shape}")
+        print(f"  Input STFT shape: {raw_stft.shape}")
         
-        # Convert to tensor
-        raw_stft_tensor = torch.from_numpy(raw_stft).float()
+        # Denoise using sliding window with overlap-add
+        print("\n  Running sliding window inference with overlap-add...")
+        denoised_signal = inferencer.denoise_full_stft(
+            raw_stft,
+            segment_length=625,  # ~20s windows
+            stride=312,          # ~10s stride (50% overlap)
+            batch_size=8
+        )
         
-        # Denoise
-        print("  Running inference...")
-        pred_stft = inferencer.denoise_stft(raw_stft_tensor)
+        # Save denoised time-domain signal
+        output_path = args.output if args.output else data_path.parent / f"{data_path.stem}_denoised_signal.npy"
+        np.save(output_path, denoised_signal)
         
-        # Save output
-        output_path = args.output if args.output else data_path.parent / f"{data_path.stem}_denoised.npy"
-        np.save(output_path, pred_stft.numpy())
-        
-        print(f"  Output shape: {pred_stft.shape}")
-        print(f"\n✓ Denoised STFT saved to {output_path}")
+        print(f"\n{'='*70}")
+        print(f"✓ Denoised signal saved to {output_path.name}")
+        print(f"  Output shape: {denoised_signal.shape}")
+        print(f"  Duration: {len(denoised_signal)/inferencer.fs:.2f}s @ {inferencer.fs}Hz")
+        print(f"{'='*70}")
         
     elif data_path.is_dir():
         # Directory inference - evaluate on dataset
