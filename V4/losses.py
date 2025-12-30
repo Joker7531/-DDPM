@@ -157,6 +157,10 @@ class CompositeLoss(nn.Module):
         Returns:
             (total_loss, loss_dict): 总损失和各项损失字典
         """
+        # 检查输入是否包含 NaN/Inf
+        if not torch.isfinite(noise_pred).all():
+            noise_pred = torch.nan_to_num(noise_pred, nan=0.0, posinf=0.0, neginf=0.0)
+        
         # 1. 噪声拟合损失
         l_noise = self.noise_loss(noise_pred, noise_target)
         
@@ -165,6 +169,11 @@ class CompositeLoss(nn.Module):
         
         # 3. 加权总损失
         total_loss = self.noise_weight * l_noise + self.reconstruct_weight * l_reconstruct
+        
+        # 4. 损失值安全检查
+        if not torch.isfinite(total_loss):
+            # 回退到仅噪声损失
+            total_loss = l_noise if torch.isfinite(l_noise) else torch.tensor(0.0, device=noise_pred.device, requires_grad=True)
         
         # 损失字典 (用于日志记录)
         loss_dict = {

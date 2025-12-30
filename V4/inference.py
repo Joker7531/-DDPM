@@ -1,0 +1,612 @@
+"""
+SpectrogramNAFNet 推理脚本
+
+本模块实现文件级推理，对输入的STFT频谱进行去噪，
+并将结果反变换回一维时域信号。
+
+支持功能:
+- 单文件推理
+- 批量文件推理
+- ISTFT 反变换
+
+作者: AI Assistant
+日期: 2025-12-30
+"""
+
+import os
+import argparse
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Union
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from tqdm import tqdm
+
+from model import SpectrogramNAFNet
+
+
+class STFTInferenceProcessor:
+    """
+    STFT域推理处理器
+    
+    对完整STFT文件进行滑动窗口推理，并实现反归一化和ISTFT。
+    
+    Args:
+        model: 训练好的SpectrogramNAFNet模型
+        device: 计算设备
+        window_size: 推理窗口大小 (帧数)
+        stride: 推理步长 (帧数)，建议与window_size相同以避免重叠
+        freq_start: 频率起始索引
+        freq_end: 频率结束索引
+        n_fft: STFT的FFT点数
+        hop_length: STFT的跳跃长度
+        sample_rate: 采样率
+        eps: 数值稳定性常数
+    """
+    
+    def __init__(
+        self,
+        model: SpectrogramNAFNet,
+        device: torch.device,
+        window_size: int = 156,
+        stride: int = 156,
+        freq_start: int = 1,
+        freq_end: int = 104,
+        n_fft: int = 512,
+        hop_length: int = 128,
+        sample_rate: int = 500,
+        eps: float = 1e-8
+    ) -> None:
+        self.model = model
+        self.device = device
+        self.window_size = window_size
+        self.stride = stride
+        self.freq_start = freq_start
+        self.freq_end = freq_end
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.sample_rate = sample_rate
+        self.eps = eps
+        
+        # 确保模型在评估模式
+        self.model.eval()
+    
+    def _compute_magnitude(self, data: np.ndarray) -> np.ndarray:
+        """
+        计算复数STFT的幅度
+        
+        Args:
+            data: 形状 [2, F, T]，Channel 0=Real, 1=Imag
+            
+        Returns:
+            幅度数组，形状 [F, T]
+        """
+        real = data[0]
+        imag = data[1]
+        magnitude = np.sqrt(real**2 + imag**2 + self.eps)
+        return magnitude
+    
+    def _normalize_slice(
+        self,
+        data: np.ndarray
+    ) -> Tuple[np.ndarray, float, float]:
+        """
+        对切片进行抗恒等映射归一化
+        
+        Args:
+            data: 形状 [2, F, T]
+            
+        Returns:
+            (normalized_data, mean, std)
+        """
+        # 计算幅度
+        magnitude = self._compute_magnitude(data)
+        
+        # Log变换
+        log_magnitude = np.log1p(magnitude)
+        
+        # 计算统计量
+        mean = float(np.mean(log_magnitude))
+        std = float(np.std(log_magnitude))
+        std = max(std, self.eps * 10)
+        
+        # 计算归一化因子
+        norm_factor = (log_magnitude - mean) / std
+        
+        # 安全计算缩放因子
+        safe_log_mag = np.maximum(log_magnitude, self.eps)
+        scale = norm_factor / safe_log_mag
+        scale = np.clip(scale, -100.0, 100.0)
+        
+        normalized_data = np.zeros_like(data)
+        normalized_data[0] = data[0] * scale
+        normalized_data[1] = data[1] * scale
+        
+        # 处理NaN/Inf
+        if not np.isfinite(normalized_data).all():
+            normalized_data = np.nan_to_num(normalized_data, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        return normalized_data, mean, std
+    
+    def _denormalize_slice(
+        self,
+        denoised_norm: np.ndarray,
+        raw_slice: np.ndarray,
+        mean: float,
+        std: float
+    ) -> np.ndarray:
+        """
+        反归一化：从归一化域恢复到原始STFT域
+        
+        策略: 计算去噪后的归一化幅度，反变换得到原始幅度，
+              结合原始raw的相位重建复数STFT。
+        
+        Args:
+            denoised_norm: 归一化域的去噪结果 [2, F, T]
+            raw_slice: 原始STFT切片 [2, F, T]
+            mean: 归一化时的均值
+            std: 归一化时的标准差
+            
+        Returns:
+            反归一化后的STFT切片 [2, F, T]
+        """
+        # 1. 计算去噪后的归一化幅度
+        denoised_mag_norm = self._compute_magnitude(denoised_norm)
+        
+        # 2. 反Z-score: 归一化幅度 -> log幅度
+        log_magnitude_denoised = denoised_mag_norm * std + mean
+        
+        # 3. 反Log变换: log(1+|S|) -> |S|
+        magnitude_denoised = np.expm1(log_magnitude_denoised)  # exp(x) - 1
+        magnitude_denoised = np.maximum(magnitude_denoised, 0)  # 确保非负
+        
+        # 4. 从原始raw提取相位
+        raw_real = raw_slice[0]
+        raw_imag = raw_slice[1]
+        raw_magnitude = np.sqrt(raw_real**2 + raw_imag**2 + self.eps)
+        
+        # 单位相位向量
+        phase_real = raw_real / (raw_magnitude + self.eps)
+        phase_imag = raw_imag / (raw_magnitude + self.eps)
+        
+        # 5. 用去噪幅度和原始相位重建复数STFT
+        denoised_stft = np.zeros_like(raw_slice)
+        denoised_stft[0] = magnitude_denoised * phase_real  # Real
+        denoised_stft[1] = magnitude_denoised * phase_imag  # Imag
+        
+        return denoised_stft
+    
+    def _pad_frequency(self, data: np.ndarray) -> np.ndarray:
+        """
+        将裁剪后的频率维度填充回原始大小
+        
+        Args:
+            data: 形状 [2, 103, T] (裁剪后的频率维度)
+            
+        Returns:
+            填充后的数据 [2, 257, T]
+        """
+        _, f_crop, t = data.shape
+        full_freq = self.n_fft // 2 + 1  # 257
+        
+        result = np.zeros((2, full_freq, t), dtype=data.dtype)
+        result[:, self.freq_start:self.freq_end, :] = data
+        
+        return result
+    
+    @torch.no_grad()
+    def process_file(
+        self,
+        raw_stft: np.ndarray,
+        overlap_mode: str = 'replace'
+    ) -> np.ndarray:
+        """
+        处理单个STFT文件
+        
+        Args:
+            raw_stft: 原始STFT数据，形状 [2, 257, T_long]
+            overlap_mode: 重叠处理模式 ('replace' 或 'average')
+            
+        Returns:
+            去噪后的STFT数据，形状 [2, 257, T_long]
+        """
+        _, full_freq, t_length = raw_stft.shape
+        
+        # 输出缓冲区
+        denoised_stft = np.copy(raw_stft)
+        
+        # 用于平均模式的计数器
+        if overlap_mode == 'average':
+            weight_buffer = np.zeros((full_freq, t_length), dtype=np.float32)
+            accum_buffer = np.zeros((2, full_freq, t_length), dtype=np.float32)
+        
+        # 计算切片数量
+        if t_length < self.window_size:
+            print(f"警告: 时间维度 {t_length} 小于窗口大小 {self.window_size}")
+            return denoised_stft
+        
+        num_slices = (t_length - self.window_size) // self.stride + 1
+        
+        for i in tqdm(range(num_slices), desc="推理中", leave=False):
+            start_idx = i * self.stride
+            end_idx = start_idx + self.window_size
+            
+            # 1. 提取切片并裁剪频率
+            raw_slice_full = raw_stft[:, :, start_idx:end_idx]  # [2, 257, window]
+            raw_slice = raw_slice_full[:, self.freq_start:self.freq_end, :]  # [2, 103, window]
+            
+            # 2. 归一化
+            raw_norm, mean, std = self._normalize_slice(raw_slice)
+            
+            # 3. 转换为tensor并推理
+            raw_tensor = torch.from_numpy(raw_norm).float().unsqueeze(0).to(self.device)
+            noise_pred = self.model(raw_tensor)
+            noise_pred = noise_pred.squeeze(0).cpu().numpy()
+            
+            # 4. 计算去噪结果 (归一化域)
+            denoised_norm = raw_norm - noise_pred
+            
+            # 5. 反归一化
+            denoised_slice = self._denormalize_slice(denoised_norm, raw_slice, mean, std)
+            
+            # 6. 填充回原始频率维度
+            denoised_slice_full = self._pad_frequency(denoised_slice)
+            
+            # 保留未处理频段的原始值
+            denoised_slice_full[:, :self.freq_start, :] = raw_slice_full[:, :self.freq_start, :]
+            denoised_slice_full[:, self.freq_end:, :] = raw_slice_full[:, self.freq_end:, :]
+            
+            # 7. 写入输出缓冲区
+            if overlap_mode == 'replace':
+                denoised_stft[:, :, start_idx:end_idx] = denoised_slice_full
+            else:  # average
+                accum_buffer[:, :, start_idx:end_idx] += denoised_slice_full
+                weight_buffer[:, start_idx:end_idx] += 1.0
+        
+        # 处理最后一个可能不完整的窗口
+        remaining = t_length - (num_slices - 1) * self.stride - self.window_size
+        if remaining > 0 and num_slices * self.stride < t_length:
+            # 处理末尾部分
+            start_idx = t_length - self.window_size
+            end_idx = t_length
+            
+            raw_slice_full = raw_stft[:, :, start_idx:end_idx]
+            raw_slice = raw_slice_full[:, self.freq_start:self.freq_end, :]
+            
+            raw_norm, mean, std = self._normalize_slice(raw_slice)
+            raw_tensor = torch.from_numpy(raw_norm).float().unsqueeze(0).to(self.device)
+            noise_pred = self.model(raw_tensor)
+            noise_pred = noise_pred.squeeze(0).cpu().numpy()
+            
+            denoised_norm = raw_norm - noise_pred
+            denoised_slice = self._denormalize_slice(denoised_norm, raw_slice, mean, std)
+            denoised_slice_full = self._pad_frequency(denoised_slice)
+            denoised_slice_full[:, :self.freq_start, :] = raw_slice_full[:, :self.freq_start, :]
+            denoised_slice_full[:, self.freq_end:, :] = raw_slice_full[:, self.freq_end:, :]
+            
+            if overlap_mode == 'replace':
+                denoised_stft[:, :, start_idx:end_idx] = denoised_slice_full
+            else:
+                accum_buffer[:, :, start_idx:end_idx] += denoised_slice_full
+                weight_buffer[:, start_idx:end_idx] += 1.0
+        
+        # 平均模式的后处理
+        if overlap_mode == 'average':
+            weight_buffer = np.maximum(weight_buffer, 1.0)
+            denoised_stft = accum_buffer / weight_buffer
+        
+        return denoised_stft
+    
+    def istft(
+        self,
+        stft_data: np.ndarray,
+        window: str = 'hann'
+    ) -> np.ndarray:
+        """
+        执行逆短时傅里叶变换 (ISTFT)
+        
+        Args:
+            stft_data: STFT数据，形状 [2, n_freq, n_frames]
+                       Channel 0=Real, 1=Imag
+            window: 窗函数类型
+            
+        Returns:
+            重建的一维时域信号
+        """
+        # 转换为复数形式
+        real = stft_data[0]  # [n_freq, n_frames]
+        imag = stft_data[1]
+        complex_stft = real + 1j * imag  # [n_freq, n_frames]
+        
+        # 转换为PyTorch张量
+        stft_tensor = torch.from_numpy(complex_stft).to(torch.complex64)
+        
+        # 创建窗函数
+        if window == 'hann':
+            win = torch.hann_window(self.n_fft)
+        elif window == 'hamming':
+            win = torch.hamming_window(self.n_fft)
+        else:
+            win = torch.ones(self.n_fft)
+        
+        # 执行ISTFT
+        # PyTorch的istft需要输入形状为 [n_freq, n_frames]
+        signal = torch.istft(
+            stft_tensor,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.n_fft,
+            window=win,
+            center=True,
+            normalized=False,
+            onesided=True,
+            length=None,
+            return_complex=False
+        )
+        
+        return signal.numpy()
+    
+    def process_and_reconstruct(
+        self,
+        raw_stft: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        完整处理流程：去噪 + ISTFT重建
+        
+        Args:
+            raw_stft: 原始STFT数据，形状 [2, 257, T]
+            
+        Returns:
+            (denoised_stft, reconstructed_signal): 去噪后的STFT和重建的一维信号
+        """
+        # 1. 去噪
+        denoised_stft = self.process_file(raw_stft)
+        
+        # 2. ISTFT重建
+        reconstructed_signal = self.istft(denoised_stft)
+        
+        return denoised_stft, reconstructed_signal
+
+
+def load_model(
+    checkpoint_path: str,
+    device: torch.device,
+    base_channels: int = 32
+) -> SpectrogramNAFNet:
+    """
+    加载训练好的模型
+    
+    Args:
+        checkpoint_path: 检查点文件路径
+        device: 计算设备
+        base_channels: 基础通道数
+        
+    Returns:
+        加载权重后的模型
+    """
+    model = SpectrogramNAFNet(
+        in_channels=2,
+        out_channels=2,
+        base_channels=base_channels,
+        num_blocks=[2, 2, 4, 8],
+        bottleneck_blocks=4
+    ).to(device)
+    
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    if 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
+    
+    model.eval()
+    print(f"模型加载成功: {checkpoint_path}")
+    
+    return model
+
+
+def process_single_file(
+    input_path: str,
+    output_dir: str,
+    processor: STFTInferenceProcessor,
+    save_stft: bool = True,
+    save_signal: bool = True
+) -> Dict[str, str]:
+    """
+    处理单个文件
+    
+    Args:
+        input_path: 输入STFT文件路径 (.npy)
+        output_dir: 输出目录
+        processor: 推理处理器
+        save_stft: 是否保存去噪后的STFT
+        save_signal: 是否保存重建的一维信号
+        
+    Returns:
+        输出文件路径字典
+    """
+    input_path = Path(input_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 加载输入数据
+    raw_stft = np.load(input_path)
+    print(f"加载文件: {input_path}")
+    print(f"  输入形状: {raw_stft.shape}")
+    
+    # 处理
+    denoised_stft, reconstructed_signal = processor.process_and_reconstruct(raw_stft)
+    
+    print(f"  去噪STFT形状: {denoised_stft.shape}")
+    print(f"  重建信号长度: {len(reconstructed_signal)}")
+    
+    # 保存结果
+    output_paths = {}
+    base_name = input_path.stem.replace('_raw', '')
+    
+    if save_stft:
+        stft_path = output_dir / f"{base_name}_denoised_stft.npy"
+        np.save(stft_path, denoised_stft)
+        output_paths['stft'] = str(stft_path)
+        print(f"  保存STFT: {stft_path}")
+    
+    if save_signal:
+        signal_path = output_dir / f"{base_name}_denoised_signal.npy"
+        np.save(signal_path, reconstructed_signal)
+        output_paths['signal'] = str(signal_path)
+        print(f"  保存信号: {signal_path}")
+    
+    return output_paths
+
+
+def batch_process(
+    input_dir: str,
+    output_dir: str,
+    processor: STFTInferenceProcessor,
+    pattern: str = '*_raw.npy'
+) -> List[Dict[str, str]]:
+    """
+    批量处理文件
+    
+    Args:
+        input_dir: 输入目录
+        output_dir: 输出目录
+        processor: 推理处理器
+        pattern: 文件匹配模式
+        
+    Returns:
+        所有输出文件路径列表
+    """
+    input_dir = Path(input_dir)
+    files = sorted(input_dir.glob(pattern))
+    
+    if len(files) == 0:
+        print(f"未找到匹配文件: {input_dir / pattern}")
+        return []
+    
+    print(f"找到 {len(files)} 个文件待处理")
+    
+    results = []
+    for file_path in tqdm(files, desc="批量处理"):
+        try:
+            result = process_single_file(
+                str(file_path),
+                output_dir,
+                processor
+            )
+            results.append(result)
+        except Exception as e:
+            print(f"处理失败: {file_path}, 错误: {e}")
+    
+    return results
+
+
+def main():
+    """主函数"""
+    parser = argparse.ArgumentParser(
+        description='SpectrogramNAFNet 推理脚本'
+    )
+    
+    parser.add_argument(
+        '--checkpoint', type=str, required=True,
+        help='模型检查点路径'
+    )
+    parser.add_argument(
+        '--input', type=str, required=True,
+        help='输入文件或目录路径'
+    )
+    parser.add_argument(
+        '--output', type=str, default='inference_output',
+        help='输出目录'
+    )
+    parser.add_argument(
+        '--batch', action='store_true',
+        help='批量处理模式'
+    )
+    parser.add_argument(
+        '--pattern', type=str, default='*_raw.npy',
+        help='批量模式下的文件匹配模式'
+    )
+    parser.add_argument(
+        '--base_channels', type=int, default=32,
+        help='模型基础通道数'
+    )
+    parser.add_argument(
+        '--window_size', type=int, default=156,
+        help='推理窗口大小'
+    )
+    parser.add_argument(
+        '--stride', type=int, default=156,
+        help='推理步长'
+    )
+    parser.add_argument(
+        '--n_fft', type=int, default=512,
+        help='STFT的FFT点数'
+    )
+    parser.add_argument(
+        '--hop_length', type=int, default=128,
+        help='STFT的跳跃长度'
+    )
+    parser.add_argument(
+        '--sample_rate', type=int, default=500,
+        help='采样率'
+    )
+    parser.add_argument(
+        '--no_stft', action='store_true',
+        help='不保存去噪后的STFT'
+    )
+    parser.add_argument(
+        '--no_signal', action='store_true',
+        help='不保存重建的一维信号'
+    )
+    parser.add_argument(
+        '--device', type=str, default='auto',
+        help='计算设备 (auto/cuda/cpu)'
+    )
+    
+    args = parser.parse_args()
+    
+    # 设备选择
+    if args.device == 'auto':
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    else:
+        device = torch.device(args.device)
+    print(f"使用设备: {device}")
+    
+    # 加载模型
+    model = load_model(args.checkpoint, device, args.base_channels)
+    
+    # 创建处理器
+    processor = STFTInferenceProcessor(
+        model=model,
+        device=device,
+        window_size=args.window_size,
+        stride=args.stride,
+        n_fft=args.n_fft,
+        hop_length=args.hop_length,
+        sample_rate=args.sample_rate
+    )
+    
+    # 处理
+    if args.batch:
+        results = batch_process(
+            args.input,
+            args.output,
+            processor,
+            args.pattern
+        )
+        print(f"\n完成: 处理了 {len(results)} 个文件")
+    else:
+        result = process_single_file(
+            args.input,
+            args.output,
+            processor,
+            save_stft=not args.no_stft,
+            save_signal=not args.no_signal
+        )
+        print(f"\n完成: {result}")
+
+
+if __name__ == '__main__':
+    main()

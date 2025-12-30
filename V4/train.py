@@ -211,15 +211,27 @@ class Trainer:
                         clean_target=clean_norm
                     )
                 
+                # 检查损失是否有效
+                if not torch.isfinite(loss):
+                    self.logger.warning(f"检测到无效损失值，跳过此batch")
+                    self.optimizer.zero_grad()
+                    continue
+                
                 # 反向传播 (缩放梯度)
                 self.scaler.scale(loss).backward()
                 
-                # 梯度裁剪
+                # 梯度裁剪 (更严格的阈值)
                 self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_norm_(
+                grad_norm = nn.utils.clip_grad_norm_(
                     self.model.parameters(),
-                    max_norm=self.config.get('grad_clip', 1.0)
+                    max_norm=self.config.get('grad_clip', 0.5)
                 )
+                
+                # 检查梯度是否有效
+                if not torch.isfinite(grad_norm):
+                    self.logger.warning(f"检测到梯度爆炸 (grad_norm={grad_norm:.4f})，跳过此batch")
+                    self.optimizer.zero_grad()
+                    continue
                 
                 # 更新参数
                 self.scaler.step(self.optimizer)
@@ -236,14 +248,26 @@ class Trainer:
                     clean_target=clean_norm
                 )
                 
+                # 检查损失是否有效
+                if not torch.isfinite(loss):
+                    self.logger.warning(f"检测到无效损失值，跳过此batch")
+                    self.optimizer.zero_grad()
+                    continue
+                
                 # 反向传播
                 loss.backward()
                 
-                # 梯度裁剪
-                nn.utils.clip_grad_norm_(
+                # 梯度裁剪 (更严格的阈值)
+                grad_norm = nn.utils.clip_grad_norm_(
                     self.model.parameters(),
-                    max_norm=self.config.get('grad_clip', 1.0)
+                    max_norm=self.config.get('grad_clip', 0.5)
                 )
+                
+                # 检查梯度是否有效
+                if not torch.isfinite(grad_norm):
+                    self.logger.warning(f"检测到梯度爆炸 (grad_norm={grad_norm:.4f})，跳过此batch")
+                    self.optimizer.zero_grad()
+                    continue
                 
                 # 更新参数
                 self.optimizer.step()

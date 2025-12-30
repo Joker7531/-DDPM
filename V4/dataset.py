@@ -229,21 +229,30 @@ class STFTSlicingDataset(Dataset):
         
         # 3. 计算统计量
         mean = float(np.mean(log_magnitude))
-        std = float(np.std(log_magnitude) + self.eps)
+        std = float(np.std(log_magnitude))
+        # 强化标准差保护，避免过小值
+        std = max(std, self.eps * 10)
         
         # 4. 计算归一化因子
         # 归一化后的log幅度: (log_mag - mean) / std
-        # 原始幅度对应的缩放因子
         norm_factor = (log_magnitude - mean) / std  # [F, T]
         
-        # 5. 将缩放因子应用到实虚部（保持相位）
-        # 新的实虚部 = 原始实虚部 * (norm_factor / log_magnitude)
-        # 这样保持相位不变，只改变幅度
-        scale = norm_factor / (log_magnitude + self.eps)  # [F, T]
+        # 5. 计算缩放因子，添加强化保护
+        # 避免 log_magnitude 过小导致的数值不稳定
+        safe_log_mag = np.maximum(log_magnitude, self.eps)
+        scale = norm_factor / safe_log_mag  # [F, T]
+        
+        # 6. 限制缩放因子范围，防止极端值
+        scale = np.clip(scale, -100.0, 100.0)
         
         normalized_data = np.zeros_like(data)
         normalized_data[0] = data[0] * scale  # Real
         normalized_data[1] = data[1] * scale  # Imag
+        
+        # 7. 检查并处理NaN/Inf
+        if not np.isfinite(normalized_data).all():
+            # 回退到简单归一化
+            normalized_data = np.nan_to_num(normalized_data, nan=0.0, posinf=0.0, neginf=0.0)
         
         return normalized_data, mean, std
     
@@ -281,14 +290,28 @@ class STFTSlicingDataset(Dataset):
         
         # 使用raw的mean和std归一化clean
         clean_norm_factor = (clean_log_mag - raw_mean) / raw_std
-        clean_scale = clean_norm_factor / (clean_log_mag + self.eps)
+        
+        # 安全计算缩放因子
+        safe_clean_log_mag = np.maximum(clean_log_mag, self.eps)
+        clean_scale = clean_norm_factor / safe_clean_log_mag
+        
+        # 限制缩放因子范围
+        clean_scale = np.clip(clean_scale, -100.0, 100.0)
         
         clean_norm = np.zeros_like(clean_slice)
         clean_norm[0] = clean_slice[0] * clean_scale
         clean_norm[1] = clean_slice[1] * clean_scale
         
+        # 检查并处理NaN/Inf
+        if not np.isfinite(clean_norm).all():
+            clean_norm = np.nan_to_num(clean_norm, nan=0.0, posinf=0.0, neginf=0.0)
+        
         # 计算残差目标: Noise = Raw - Clean
         noise_norm = raw_norm - clean_norm
+        
+        # 检查并处理NaN/Inf
+        if not np.isfinite(noise_norm).all():
+            noise_norm = np.nan_to_num(noise_norm, nan=0.0, posinf=0.0, neginf=0.0)
         
         # 转换为PyTorch张量
         return {
