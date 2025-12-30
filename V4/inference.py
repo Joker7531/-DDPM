@@ -31,12 +31,13 @@ class STFTInferenceProcessor:
     STFT域推理处理器
     
     对完整STFT文件进行滑动窗口推理，并实现反归一化和ISTFT。
+    使用50%重叠 + Hann窗加权平均，减少窗口边界伪影。
     
     Args:
         model: 训练好的SpectrogramNAFNet模型
         device: 计算设备
         window_size: 推理窗口大小 (帧数)
-        stride: 推理步长 (帧数)，建议与window_size相同以避免重叠
+        overlap_ratio: 窗口重叠比例 (0.5 表示 50% 重叠)
         freq_start: 频率起始索引
         freq_end: 频率结束索引
         n_fft: STFT的FFT点数
@@ -50,7 +51,7 @@ class STFTInferenceProcessor:
         model: SpectrogramNAFNet,
         device: torch.device,
         window_size: int = 156,
-        stride: int = 156,
+        overlap_ratio: float = 0.5,
         freq_start: int = 1,
         freq_end: int = 104,
         n_fft: int = 512,
@@ -61,7 +62,8 @@ class STFTInferenceProcessor:
         self.model = model
         self.device = device
         self.window_size = window_size
-        self.stride = stride
+        self.overlap_ratio = overlap_ratio
+        self.stride = int(window_size * (1 - overlap_ratio))  # 50% overlap -> stride = 78
         self.freq_start = freq_start
         self.freq_end = freq_end
         self.n_fft = n_fft
@@ -69,8 +71,24 @@ class STFTInferenceProcessor:
         self.sample_rate = sample_rate
         self.eps = eps
         
+        # 预计算窗函数权重 (Hann窗用于平滑过渡)
+        self.window_weights = self._create_window_weights()
+        
         # 确保模型在评估模式
         self.model.eval()
+    
+    def _create_window_weights(self) -> np.ndarray:
+        """
+        创建用于重叠加权平均的窗函数
+        
+        使用Hann窗实现平滑过渡，减少窗口边界伪影
+        
+        Returns:
+            窗函数权重，形状 [window_size]
+        """
+        # Hann窗: 0.5 * (1 - cos(2*pi*n/(N-1)))
+        window = np.hanning(self.window_size).astype(np.float32)
+        return window
     
     def _compute_magnitude(self, data: np.ndarray) -> np.ndarray:
         """
@@ -198,35 +216,35 @@ class STFTInferenceProcessor:
     @torch.no_grad()
     def process_file(
         self,
-        raw_stft: np.ndarray,
-        overlap_mode: str = 'replace'
+        raw_stft: np.ndarray
     ) -> np.ndarray:
         """
-        处理单个STFT文件
+        处理单个STFT文件 (50%重叠 + 加权平均)
+        
+        使用Hann窗进行加权平均，减少窗口边界伪影。
         
         Args:
             raw_stft: 原始STFT数据，形状 [2, 257, T_long]
-            overlap_mode: 重叠处理模式 ('replace' 或 'average')
             
         Returns:
             去噪后的STFT数据，形状 [2, 257, T_long]
         """
         _, full_freq, t_length = raw_stft.shape
         
-        # 输出缓冲区
-        denoised_stft = np.copy(raw_stft)
-        
-        # 用于平均模式的计数器
-        if overlap_mode == 'average':
-            weight_buffer = np.zeros((full_freq, t_length), dtype=np.float32)
-            accum_buffer = np.zeros((2, full_freq, t_length), dtype=np.float32)
-        
         # 计算切片数量
         if t_length < self.window_size:
             print(f"警告: 时间维度 {t_length} 小于窗口大小 {self.window_size}")
-            return denoised_stft
+            return raw_stft.copy()
         
+        # 加权累加缓冲区
+        accum_buffer = np.zeros((2, full_freq, t_length), dtype=np.float32)
+        weight_buffer = np.zeros(t_length, dtype=np.float32)
+        
+        # 计算完整窗口数量
         num_slices = (t_length - self.window_size) // self.stride + 1
+        
+        # 窗函数权重 (Hann窗)
+        window_weights = self.window_weights  # [window_size]
         
         for i in tqdm(range(num_slices), desc="推理中", leave=False):
             start_idx = i * self.stride
@@ -257,17 +275,15 @@ class STFTInferenceProcessor:
             denoised_slice_full[:, :self.freq_start, :] = raw_slice_full[:, :self.freq_start, :]
             denoised_slice_full[:, self.freq_end:, :] = raw_slice_full[:, self.freq_end:, :]
             
-            # 7. 写入输出缓冲区
-            if overlap_mode == 'replace':
-                denoised_stft[:, :, start_idx:end_idx] = denoised_slice_full
-            else:  # average
-                accum_buffer[:, :, start_idx:end_idx] += denoised_slice_full
-                weight_buffer[:, start_idx:end_idx] += 1.0
+            # 7. 加权累加 (使用Hann窗权重)
+            # 权重广播到所有频率
+            accum_buffer[:, :, start_idx:end_idx] += denoised_slice_full * window_weights[np.newaxis, np.newaxis, :]
+            weight_buffer[start_idx:end_idx] += window_weights
         
-        # 处理最后一个可能不完整的窗口
-        remaining = t_length - (num_slices - 1) * self.stride - self.window_size
-        if remaining > 0 and num_slices * self.stride < t_length:
-            # 处理末尾部分
+        # 处理末尾未覆盖的部分 (如果有)
+        last_covered = (num_slices - 1) * self.stride + self.window_size
+        if last_covered < t_length:
+            # 处理最后一个窗口，从末尾往前取
             start_idx = t_length - self.window_size
             end_idx = t_length
             
@@ -285,16 +301,13 @@ class STFTInferenceProcessor:
             denoised_slice_full[:, :self.freq_start, :] = raw_slice_full[:, :self.freq_start, :]
             denoised_slice_full[:, self.freq_end:, :] = raw_slice_full[:, self.freq_end:, :]
             
-            if overlap_mode == 'replace':
-                denoised_stft[:, :, start_idx:end_idx] = denoised_slice_full
-            else:
-                accum_buffer[:, :, start_idx:end_idx] += denoised_slice_full
-                weight_buffer[:, start_idx:end_idx] += 1.0
+            accum_buffer[:, :, start_idx:end_idx] += denoised_slice_full * window_weights[np.newaxis, np.newaxis, :]
+            weight_buffer[start_idx:end_idx] += window_weights
         
-        # 平均模式的后处理
-        if overlap_mode == 'average':
-            weight_buffer = np.maximum(weight_buffer, 1.0)
-            denoised_stft = accum_buffer / weight_buffer
+        # 归一化：除以权重和
+        # 避免除零
+        weight_buffer = np.maximum(weight_buffer, self.eps)
+        denoised_stft = accum_buffer / weight_buffer[np.newaxis, np.newaxis, :]
         
         return denoised_stft
     
@@ -537,8 +550,8 @@ def main():
         help='推理窗口大小'
     )
     parser.add_argument(
-        '--stride', type=int, default=156,
-        help='推理步长'
+        '--overlap_ratio', type=float, default=0.5,
+        help='窗口重叠比例 (0.5 表示 50%% 重叠)'
     )
     parser.add_argument(
         '--n_fft', type=int, default=512,
@@ -577,16 +590,18 @@ def main():
     # 加载模型
     model = load_model(args.checkpoint, device, args.base_channels)
     
-    # 创建处理器
+    # 创建处理器 (使用50%重叠 + Hann窗加权平均)
     processor = STFTInferenceProcessor(
         model=model,
         device=device,
         window_size=args.window_size,
-        stride=args.stride,
+        overlap_ratio=args.overlap_ratio,
         n_fft=args.n_fft,
         hop_length=args.hop_length,
         sample_rate=args.sample_rate
     )
+    
+    print(f"推理参数: 窗口大小={args.window_size}, 重叠比例={args.overlap_ratio*100:.0f}%, 步长={processor.stride}")
     
     # 处理
     if args.batch:
