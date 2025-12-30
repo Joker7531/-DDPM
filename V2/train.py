@@ -262,9 +262,9 @@ class Trainer:
             
             # Update progress bar
             pbar.set_postfix({
+                'loss': f"{loss_dict['total']:.4f}",
                 'l1': f"{loss_dict['l1_real_imag']:.4f}",
-                'log_mag': f"{loss_dict['log_magnitudese']:.4f}",
-                'l1': f"{loss_dict['l1']:.4f}"
+                'log_mag': f"{loss_dict['log_magnitude']:.4f}"
             })
             
             # Log to TensorBoard
