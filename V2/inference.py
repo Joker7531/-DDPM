@@ -512,11 +512,6 @@ def main():
         output_path = args.output if args.output else data_path.parent / f"{data_path.stem}_denoised_signal.npy"
         np.save(output_path, denoised_signal)
         
-        print(f"\n{'='*70}")
-        print(f"✓ Denoised signal saved to {output_path.name}")
-        print(f"  Output shape: {denoised_signal.shape}")
-        print(f"  Duration: {len(denoised_signal)/inferencer.fs:.2f}s @ {inferencer.fs}Hz")
-        print(f"{'='*70}")
         
     elif data_path.is_dir():
         # Directory inference - evaluate on dataset
