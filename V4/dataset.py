@@ -77,8 +77,8 @@ class STFTSlicingDataset(Dataset):
         self.freq_start = self.FREQ_START
         self.freq_end = self.FREQ_END
         
-        # 预计算所有切片索引
-        self.slice_indices: List[Tuple[str, int]] = []
+        # 预计算所有切片索引: (raw_file, clean_file, start_idx)
+        self.slice_indices: List[Tuple[str, str, int]] = []
         self._precompute_slice_indices()
         
         print(f"[{self.mode.upper()}] 数据集初始化完成:")
@@ -87,47 +87,65 @@ class STFTSlicingDataset(Dataset):
         print(f"  - 窗口大小: {self.window_size}")
         print(f"  - 滑动步长: {self.stride}")
     
-    def _get_file_list(self) -> List[str]:
+    def _get_file_list(self) -> List[Tuple[str, str]]:
         """
-        获取数据目录中的所有.npy文件列表
+        获取数据目录中的所有匹配的.npy文件对列表
+        
+        文件名格式:
+            - raw目录: {split}_{id}_raw.npy (如 train_001_raw.npy)
+            - clean目录: {split}_{id}_clean.npy (如 train_001_clean.npy)
         
         Returns:
-            文件名列表（不含路径）
+            文件对列表: [(raw_filename, clean_filename), ...]
         """
-        raw_files = set(f for f in os.listdir(self.raw_dir) if f.endswith('.npy'))
-        clean_files = set(f for f in os.listdir(self.clean_dir) if f.endswith('.npy'))
+        raw_files = [f for f in os.listdir(self.raw_dir) if f.endswith('_raw.npy')]
+        clean_files = set(f for f in os.listdir(self.clean_dir) if f.endswith('_clean.npy'))
         
-        # 取交集，确保raw和clean都存在
-        common_files = sorted(list(raw_files & clean_files))
+        # 匹配raw和clean文件
+        # raw: train_001_raw.npy -> 提取 train_001
+        # clean: train_001_clean.npy
+        matched_pairs = []
+        for raw_file in raw_files:
+            # 提取基础名称: train_001_raw.npy -> train_001
+            base_name = raw_file.replace('_raw.npy', '')
+            clean_file = f"{base_name}_clean.npy"
+            
+            if clean_file in clean_files:
+                matched_pairs.append((raw_file, clean_file))
         
-        if len(common_files) == 0:
-            raise ValueError(f"在 {self.raw_dir} 和 {self.clean_dir} 中未找到匹配的.npy文件")
+        matched_pairs = sorted(matched_pairs, key=lambda x: x[0])
         
-        return common_files
+        if len(matched_pairs) == 0:
+            raise ValueError(
+                f"在 {self.raw_dir} 和 {self.clean_dir} 中未找到匹配的文件对\n"
+                f"预期格式: raw目录下 *_raw.npy, clean目录下 *_clean.npy"
+            )
+        
+        return matched_pairs
     
     def _precompute_slice_indices(self) -> None:
         """
         预计算所有文件的切片索引
         
         遍历所有文件，根据时间维度长度和滑动窗口参数，
-        计算每个有效切片的(文件名, 起始帧索引)元组。
+        计算每个有效切片的(raw文件名, clean文件名, 起始帧索引)元组。
         """
-        file_list = self._get_file_list()
+        file_pairs = self._get_file_list()
         
-        for filename in file_list:
+        for raw_file, clean_file in file_pairs:
             # 加载文件获取时间维度长度
-            raw_path = self.raw_dir / filename
+            raw_path = self.raw_dir / raw_file
             data = np.load(raw_path)
             
             # 预期形状: [2, 257, T_long]
             if data.ndim != 3 or data.shape[0] != 2:
-                raise ValueError(f"文件 {filename} 形状异常: {data.shape}, 预期 [2, 257, T]")
+                raise ValueError(f"文件 {raw_file} 形状异常: {data.shape}, 预期 [2, 257, T]")
             
             t_length = data.shape[2]
             
             # 计算可提取的切片数量
             if t_length < self.window_size:
-                print(f"警告: 文件 {filename} 时间维度 {t_length} 小于窗口大小 {self.window_size}，跳过")
+                print(f"警告: 文件 {raw_file} 时间维度 {t_length} 小于窗口大小 {self.window_size}，跳过")
                 continue
             
             # 滑动窗口切片
@@ -135,26 +153,28 @@ class STFTSlicingDataset(Dataset):
             
             for i in range(num_slices):
                 start_idx = i * self.stride
-                self.slice_indices.append((filename, start_idx))
+                self.slice_indices.append((raw_file, clean_file, start_idx))
     
     def _load_slice(
         self,
-        filename: str,
+        raw_file: str,
+        clean_file: str,
         start_idx: int
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         加载指定文件的指定切片
         
         Args:
-            filename: 文件名
+            raw_file: raw数据文件名 (如 train_001_raw.npy)
+            clean_file: clean数据文件名 (如 train_001_clean.npy)
             start_idx: 切片起始帧索引
             
         Returns:
             (raw_slice, clean_slice): 原始和干净数据的切片
         """
         # 加载原始数据
-        raw_path = self.raw_dir / filename
-        clean_path = self.clean_dir / filename
+        raw_path = self.raw_dir / raw_file
+        clean_path = self.clean_dir / clean_file
         
         raw_data = np.load(raw_path)
         clean_data = np.load(clean_path)
@@ -246,10 +266,10 @@ class STFTSlicingDataset(Dataset):
                 - 'std': 原始数据的归一化标准差
                 - 'clean_norm': 归一化后的干净数据 [2, 103, 156]
         """
-        filename, start_idx = self.slice_indices[idx]
+        raw_file, clean_file, start_idx = self.slice_indices[idx]
         
         # 加载切片
-        raw_slice, clean_slice = self._load_slice(filename, start_idx)
+        raw_slice, clean_slice = self._load_slice(raw_file, clean_file, start_idx)
         
         # 抗恒等映射归一化
         raw_norm, raw_mean, raw_std = self._anti_identity_normalize(raw_slice)
