@@ -165,7 +165,7 @@ class PrecomputedSTFTDataset(Dataset):
         self,
         root_dir: str,
         split: str = 'train',
-        transform: Optional[Any] = None,
+        transform: Optional[any] = None,
         segment_length: int = 625,  # ~20s @ hop_length=32, fs=500
         stride: Optional[int] = None  # If None, uses segment_length (no overlap)
     ):
