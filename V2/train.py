@@ -472,7 +472,7 @@ def main():
         'hop_length': 64,
         
         # Training
-        'batch_size': 8,
+        'batch_size': 16,
         'num_epochs': 200,
         'learning_rate': 1e-4,
         'weight_decay': 1e-5,

@@ -141,8 +141,8 @@ class Inferencer:
     ):
         self.device = device
         
-        # Load checkpoint
-        checkpoint = torch.load(model_path, map_location=device)
+        # Load checkpoint (PyTorch 2.6+ requires weights_only=False for full checkpoints)
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
         
         # Get config from checkpoint or use provided
         if config is None:
@@ -363,12 +363,14 @@ def main():
     parser = argparse.ArgumentParser(description='Run inference with SpectrogramUNet')
     parser.add_argument('--model', type=str, default='./checkpoints/best.pth',
                         help='Path to model checkpoint')
-    parser.add_argument('--data', type=str, default='../../dataset',
-                        help='Path to dataset root')
+    parser.add_argument('--data', type=str, required=True,
+                        help='Path to input (.npy STFT file or dataset root directory)')
+    parser.add_argument('--output', type=str, default=None,
+                        help='Output path for single file inference (.npy)')
     parser.add_argument('--split', type=str, default='test',
-                        help='Dataset split to evaluate')
+                        help='Dataset split to evaluate (only for directory input)')
     parser.add_argument('--save-dir', type=str, default='./results',
-                        help='Directory to save results')
+                        help='Directory to save results (only for directory input)')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device to use (cuda or cpu)')
     
@@ -380,25 +382,57 @@ def main():
         device=args.device if torch.cuda.is_available() else 'cpu'
     )
     
-    # Load test dataset
-    test_dataset = EEGSTFTDataset(
-        root_dir=args.data,
-        split=args.split,
-        fs=inferencer.fs,
-        nperseg=inferencer.nperseg,
-        noverlap=inferencer.noverlap
-    )
+    data_path = Path(args.data)
     
-    # Evaluate
-    metrics = inferencer.evaluate_dataset(test_dataset, save_dir=args.save_dir)
+    # Check if input is a single .npy file or a directory
+    if data_path.is_file() and data_path.suffix == '.npy':
+        # Single file inference
+        print(f"\nProcessing single file: {data_path}")
+        
+        # Load STFT
+        raw_stft = np.load(data_path)
+        print(f"  Input shape: {raw_stft.shape}")
+        
+        # Convert to tensor
+        raw_stft_tensor = torch.from_numpy(raw_stft).float()
+        
+        # Denoise
+        print("  Running inference...")
+        pred_stft = inferencer.denoise_stft(raw_stft_tensor)
+        
+        # Save output
+        output_path = args.output if args.output else data_path.parent / f"{data_path.stem}_denoised.npy"
+        np.save(output_path, pred_stft.numpy())
+        
+        print(f"  Output shape: {pred_stft.shape}")
+        print(f"\n✓ Denoised STFT saved to {output_path}")
+        
+    elif data_path.is_dir():
+        # Directory inference - evaluate on dataset
+        print(f"\nEvaluating on dataset: {data_path}")
+        
+        from dataset import PrecomputedSTFTDataset
+        
+        # Load test dataset
+        test_dataset = PrecomputedSTFTDataset(
+            root_dir=args.data,
+            split=args.split,
+            segment_length=625  # Use default segment length
+        )
+        
+        # Evaluate
+        metrics = inferencer.evaluate_dataset(test_dataset, save_dir=args.save_dir)
+        
+        # Save metrics
+        import json
+        metrics_path = Path(args.save_dir) / 'metrics.json'
+        with open(metrics_path, 'w') as f:
+            json.dump(metrics, f, indent=4)
+        
+        print(f"\n✓ Results saved to {args.save_dir}")
     
-    # Save metrics
-    import json
-    metrics_path = Path(args.save_dir) / 'metrics.json'
-    with open(metrics_path, 'w') as f:
-        json.dump(metrics, f, indent=4)
-    
-    print(f"\n✓ Results saved to {args.save_dir}")
+    else:
+        raise ValueError(f"Invalid input: {data_path}. Must be a .npy file or directory.")
 
 
 if __name__ == "__main__":
