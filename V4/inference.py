@@ -157,41 +157,65 @@ class STFTInferenceProcessor:
         """
         反归一化：从归一化域恢复到原始STFT域
         
-        策略: 计算去噪后的归一化幅度，反变换得到原始幅度，
-              结合原始raw的相位重建复数STFT。
+        归一化过程:
+            log_mag = log1p(|S|)
+            norm_factor = (log_mag - mean) / std
+            scale = norm_factor / log_mag
+            S_norm = S * scale
+        
+        反归一化过程:
+            1. 从去噪后的归一化数据计算幅度 |S_norm|
+            2. 由于 scale = norm_factor / log_mag，且 |S_norm| = |S| * |scale|
+               我们需要找到原始幅度 |S|
+            3. 使用迭代或直接求解来恢复
+        
+        简化策略：使用原始raw的相位，只修改幅度
         
         Args:
             denoised_norm: 归一化域的去噪结果 [2, F, T]
-            raw_slice: 原始STFT切片 [2, F, T]
+            raw_slice: 原始STFT切片 [2, F, T] (未归一化)
             mean: 归一化时的均值
             std: 归一化时的标准差
             
         Returns:
             反归一化后的STFT切片 [2, F, T]
         """
-        # 1. 计算去噪后的归一化幅度
-        denoised_mag_norm = self._compute_magnitude(denoised_norm)
+        # 计算去噪后归一化数据的幅度
+        denoised_mag_norm = self._compute_magnitude(denoised_norm)  # |S_denoised_norm|
         
-        # 2. 反Z-score: 归一化幅度 -> log幅度
-        log_magnitude_denoised = denoised_mag_norm * std + mean
+        # 计算原始数据的幅度和log幅度
+        raw_magnitude = self._compute_magnitude(raw_slice)  # |S_raw|
+        raw_log_mag = np.log1p(raw_magnitude)
         
-        # 3. 反Log变换: log(1+|S|) -> |S|
-        magnitude_denoised = np.expm1(log_magnitude_denoised)  # exp(x) - 1
-        magnitude_denoised = np.maximum(magnitude_denoised, 0)  # 确保非负
+        # 计算原始数据归一化时的scale
+        raw_norm_factor = (raw_log_mag - mean) / std
+        safe_raw_log_mag = np.maximum(raw_log_mag, self.eps)
+        raw_scale = np.clip(raw_norm_factor / safe_raw_log_mag, -100.0, 100.0)
         
-        # 4. 从原始raw提取相位
+        # 原始归一化幅度: |S_raw_norm| = |S_raw| * |scale|
+        raw_mag_norm = raw_magnitude * np.abs(raw_scale)
+        
+        # 计算幅度比例: denoised/raw (在归一化域)
+        safe_raw_mag_norm = np.maximum(raw_mag_norm, self.eps)
+        magnitude_ratio = denoised_mag_norm / safe_raw_mag_norm
+        
+        # 限制比例范围，避免极端放大
+        magnitude_ratio = np.clip(magnitude_ratio, 0.0, 10.0)
+        
+        # 将比例应用到原始幅度上
+        denoised_magnitude = raw_magnitude * magnitude_ratio
+        
+        # 从原始raw提取相位 (单位相位向量)
         raw_real = raw_slice[0]
         raw_imag = raw_slice[1]
-        raw_magnitude = np.sqrt(raw_real**2 + raw_imag**2 + self.eps)
+        safe_raw_magnitude = np.maximum(raw_magnitude, self.eps)
+        phase_real = raw_real / safe_raw_magnitude
+        phase_imag = raw_imag / safe_raw_magnitude
         
-        # 单位相位向量
-        phase_real = raw_real / (raw_magnitude + self.eps)
-        phase_imag = raw_imag / (raw_magnitude + self.eps)
-        
-        # 5. 用去噪幅度和原始相位重建复数STFT
+        # 用去噪幅度和原始相位重建复数STFT
         denoised_stft = np.zeros_like(raw_slice)
-        denoised_stft[0] = magnitude_denoised * phase_real  # Real
-        denoised_stft[1] = magnitude_denoised * phase_imag  # Imag
+        denoised_stft[0] = denoised_magnitude * phase_real  # Real
+        denoised_stft[1] = denoised_magnitude * phase_imag  # Imag
         
         return denoised_stft
     
@@ -216,7 +240,8 @@ class STFTInferenceProcessor:
     @torch.no_grad()
     def process_file(
         self,
-        raw_stft: np.ndarray
+        raw_stft: np.ndarray,
+        debug: bool = False
     ) -> np.ndarray:
         """
         处理单个STFT文件 (50%重叠 + 加权平均)
@@ -225,11 +250,17 @@ class STFTInferenceProcessor:
         
         Args:
             raw_stft: 原始STFT数据，形状 [2, 257, T_long]
+            debug: 是否打印调试信息
             
         Returns:
             去噪后的STFT数据，形状 [2, 257, T_long]
         """
         _, full_freq, t_length = raw_stft.shape
+        
+        if debug:
+            raw_mag = np.sqrt(raw_stft[0]**2 + raw_stft[1]**2)
+            print(f"[DEBUG] 输入STFT: shape={raw_stft.shape}, "
+                  f"幅度范围=[{raw_mag.min():.4f}, {raw_mag.max():.4f}]")
         
         # 计算切片数量
         if t_length < self.window_size:
@@ -257,13 +288,45 @@ class STFTInferenceProcessor:
             # 2. 归一化
             raw_norm, mean, std = self._normalize_slice(raw_slice)
             
+            # 调试：第一个切片打印详细信息
+            if debug and i == 0:
+                print(f"[DEBUG] 切片0 归一化: mean={mean:.4f}, std={std:.4f}")
+                print(f"[DEBUG] 切片0 raw_norm范围: [{raw_norm.min():.4f}, {raw_norm.max():.4f}]")
+            
             # 3. 转换为tensor并推理
             raw_tensor = torch.from_numpy(raw_norm).float().unsqueeze(0).to(self.device)
             noise_pred = self.model(raw_tensor)
             noise_pred = noise_pred.squeeze(0).cpu().numpy()
             
+            # 调试
+            if debug and i == 0:
+                print(f"[DEBUG] 切片0 模型预测噪声范围: [{noise_pred.min():.4f}, {noise_pred.max():.4f}]")
+            
             # 4. 计算去噪结果 (归一化域)
             denoised_norm = raw_norm - noise_pred
+            
+            # 保护：检测异常情况 (去噪结果接近零)
+            denoised_mag = np.sqrt(denoised_norm[0]**2 + denoised_norm[1]**2 + self.eps)
+            raw_mag = np.sqrt(raw_norm[0]**2 + raw_norm[1]**2 + self.eps)
+            
+            # 如果去噪结果幅度过小（小于原始的1%），可能是模型问题
+            ratio = denoised_mag.mean() / (raw_mag.mean() + self.eps)
+            if ratio < 0.01:
+                if debug or i == 0:
+                    print(f"[WARNING] 切片{i}: 去噪结果幅度异常小 (ratio={ratio:.4f}), 使用原始数据")
+                denoised_norm = raw_norm.copy()
+            
+            if debug and i == 0:
+                print(f"[DEBUG] 切片0 denoised_norm范围: [{denoised_norm.min():.4f}, {denoised_norm.max():.4f}]")
+            
+            # 5. 反归一化
+            denoised_slice = self._denormalize_slice(denoised_norm, raw_slice, mean, std)
+            
+            if debug and i == 0:
+                denoised_mag = np.sqrt(denoised_slice[0]**2 + denoised_slice[1]**2)
+                raw_mag = np.sqrt(raw_slice[0]**2 + raw_slice[1]**2)
+                print(f"[DEBUG] 切片0 反归一化后幅度范围: [{denoised_mag.min():.4f}, {denoised_mag.max():.4f}]")
+                print(f"[DEBUG] 切片0 原始幅度范围: [{raw_mag.min():.4f}, {raw_mag.max():.4f}]")
             
             # 5. 反归一化
             denoised_slice = self._denormalize_slice(denoised_norm, raw_slice, mean, std)
@@ -296,6 +359,14 @@ class STFTInferenceProcessor:
             noise_pred = noise_pred.squeeze(0).cpu().numpy()
             
             denoised_norm = raw_norm - noise_pred
+            
+            # 保护：检测异常情况
+            denoised_mag = np.sqrt(denoised_norm[0]**2 + denoised_norm[1]**2 + self.eps)
+            raw_mag = np.sqrt(raw_norm[0]**2 + raw_norm[1]**2 + self.eps)
+            ratio = denoised_mag.mean() / (raw_mag.mean() + self.eps)
+            if ratio < 0.01:
+                denoised_norm = raw_norm.copy()
+            
             denoised_slice = self._denormalize_slice(denoised_norm, raw_slice, mean, std)
             denoised_slice_full = self._pad_frequency(denoised_slice)
             denoised_slice_full[:, :self.freq_start, :] = raw_slice_full[:, :self.freq_start, :]
@@ -305,9 +376,24 @@ class STFTInferenceProcessor:
             weight_buffer[start_idx:end_idx] += window_weights
         
         # 归一化：除以权重和
-        # 避免除零
-        weight_buffer = np.maximum(weight_buffer, self.eps)
-        denoised_stft = accum_buffer / weight_buffer[np.newaxis, np.newaxis, :]
+        # 对于权重为零的区域，使用原始数据
+        weight_mask = weight_buffer > self.eps
+        weight_buffer_safe = np.where(weight_mask, weight_buffer, 1.0)
+        
+        denoised_stft = accum_buffer / weight_buffer_safe[np.newaxis, np.newaxis, :]
+        
+        # 对于未覆盖的区域，使用原始数据
+        for i in range(t_length):
+            if not weight_mask[i]:
+                denoised_stft[:, :, i] = raw_stft[:, :, i]
+        
+        if debug:
+            denoised_mag = np.sqrt(denoised_stft[0]**2 + denoised_stft[1]**2)
+            print(f"[DEBUG] 输出STFT幅度范围: [{denoised_mag.min():.4f}, {denoised_mag.max():.4f}]")
+            print(f"[DEBUG] 权重缓冲区范围: [{weight_buffer.min():.4f}, {weight_buffer.max():.4f}]")
+            uncovered = (~weight_mask).sum()
+            if uncovered > 0:
+                print(f"[DEBUG] 未覆盖帧数: {uncovered} (使用原始数据填充)")
         
         return denoised_stft
     
@@ -362,22 +448,28 @@ class STFTInferenceProcessor:
     
     def process_and_reconstruct(
         self,
-        raw_stft: np.ndarray
+        raw_stft: np.ndarray,
+        debug: bool = False
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         完整处理流程：去噪 + ISTFT重建
         
         Args:
             raw_stft: 原始STFT数据，形状 [2, 257, T]
+            debug: 是否打印调试信息
             
         Returns:
             (denoised_stft, reconstructed_signal): 去噪后的STFT和重建的一维信号
         """
         # 1. 去噪
-        denoised_stft = self.process_file(raw_stft)
+        denoised_stft = self.process_file(raw_stft, debug=debug)
         
         # 2. ISTFT重建
         reconstructed_signal = self.istft(denoised_stft)
+        
+        if debug:
+            print(f"[DEBUG] ISTFT输出: length={len(reconstructed_signal)}, "
+                  f"range=[{reconstructed_signal.min():.4f}, {reconstructed_signal.max():.4f}]")
         
         return denoised_stft, reconstructed_signal
 
