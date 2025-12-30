@@ -55,7 +55,7 @@ class STFTInferenceProcessor:
         freq_start: int = 1,
         freq_end: int = 104,
         n_fft: int = 512,
-        hop_length: int = 128,
+        hop_length: int = 64,
         sample_rate: int = 500,
         eps: float = 1e-8
     ) -> None:
