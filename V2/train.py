@@ -123,8 +123,8 @@ class Trainer:
         val_loader: DataLoader,
         config: dict,
         device: str = 'cuda',
-        checkpoint_dir: str = './checkpoints',
-        log_dir: str = './logs'
+        checkpoint_dir: str = './output_V2/checkpoints',
+        log_dir: str = './output_V2/logs'
     ):
         self.model = model.to(device)
         self.train_loader = train_loader
