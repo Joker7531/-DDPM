@@ -1,0 +1,115 @@
+# Configuration file for SpectrogramUNet Training
+# You can modify these parameters based on your specific needs
+
+# ============================================================================
+# Model Configuration
+# ============================================================================
+model:
+  in_channels: 2              # Real + Imaginary parts
+  out_channels: 2             # Real + Imaginary parts
+  base_channels: 32           # Base number of channels (32 for ~8M params, 64 for ~31M)
+  depth: 4                    # U-Net depth (number of pooling operations)
+
+# ============================================================================
+# Dataset Configuration
+# ============================================================================
+dataset:
+  root: "../../dataset"       # Path to dataset root directory
+  metadata_file: "metadata.csv"
+  
+  # STFT Parameters
+  fs: 500                     # Sampling frequency in Hz
+  n_fft: 512                  # FFT length
+  hop_length: 64              # Hop length (high overlap for better time resolution)
+  # Note: noverlap = n_fft - hop_length = 512 - 64 = 448
+  
+  # Data splits
+  train_split: "train"
+  val_split: "val"
+  test_split: "test"
+
+# ============================================================================
+# Training Configuration
+# ============================================================================
+training:
+  # Batch and epochs
+  batch_size: 64               # Reduce if OOM, increase for faster training
+  num_epochs: 200             # Total training epochs
+  num_workers: -1              # DataLoader workers (0 for Windows if issues)
+  
+  # Optimization
+  learning_rate: 0.0001       # Initial learning rate
+  weight_decay: 0.00001       # L2 regularization
+  grad_clip: 1.0              # Gradient clipping (null to disable)
+  
+  # Loss weights
+  l1_weight: 1.0              # Weight for L1 loss on Real/Imag parts
+  log_mag_weight: 1.0         # Weight for Log-Magnitude L1 loss (critical for EEG high-freq)
+  epsilon: 1e-8               # Small constant for numerical stability in log-magnitude
+  
+  # Learning rate scheduler
+  scheduler:
+    type: "ReduceLROnPlateau"
+    patience: 10              # Epochs to wait before reducing LR
+    factor: 0.5               # LR reduction factor
+    min_lr: 0.000001          # Minimum learning rate
+  
+  # Checkpointing
+  save_interval: 10           # Save checkpoint every N epochs
+  checkpoint_dir: "./checkpoints"
+  
+  # Logging
+  log_interval: 10            # Log metrics every N batches
+  log_dir: "./logs"
+  
+  # Device
+  device: "cuda"              # "cuda" or "cpu"
+  mixed_precision: false      # Enable mixed precision training (AMP)
+
+# ============================================================================
+# Inference Configuration
+# ============================================================================
+inference:
+  model_path: "./checkpoints/best.pth"
+  batch_size: 64              # Larger batch size for inference
+  save_visualizations: true   # Save visualization plots
+  num_visualizations: 10      # Number of samples to visualize
+  output_dir: "./results"
+
+# ============================================================================
+# Data Augmentation (Optional - for future implementation)
+# ============================================================================
+augmentation:
+  enabled: false
+  time_shift:
+    enabled: false
+    max_shift: 0.1            # Maximum shift as fraction of length
+  amplitude_scale:
+    enabled: false
+    min_scale: 0.8
+    max_scale: 1.2
+  additive_noise:
+    enabled: false
+    noise_level: 0.01
+
+# ============================================================================
+# Advanced Settings
+# ============================================================================
+advanced:
+  # Gradient accumulation (simulate larger batch size)
+  gradient_accumulation_steps: 1
+  
+  # Early stopping
+  early_stopping:
+    enabled: true
+    patience: 30              # Epochs to wait before stopping
+    min_delta: 0.0001         # Minimum improvement required
+  
+  # Resume training
+  resume_from: null           # Path to checkpoint to resume from
+  
+  # Random seed for reproducibility
+  seed: 42
+  
+  # Deterministic mode (slower but reproducible)
+  deterministic: false
