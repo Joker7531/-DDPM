@@ -93,7 +93,7 @@ class Up(nn.Module):
     Upscaling block with Upsample + Concatenation + DoubleConv.
     
     Args:
-        in_channels (int): Number of input channels
+        in_channels (int): Number of input channels (upsampled + skip)
         out_channels (int): Number of output channels
         bilinear (bool): Use bilinear upsampling if True, else transposed conv
     """
@@ -108,13 +108,15 @@ class Up(nn.Module):
         
         if bilinear:
             self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-            self.conv = DoubleConv(in_channels, out_channels, in_channels // 2)
         else:
+            # For transposed conv, we need to upsample the decoder feature map
             self.up = nn.ConvTranspose2d(
-                in_channels, in_channels // 2,
+                in_channels // 2, in_channels // 2,  # Only upsample the decoder part
                 kernel_size=2, stride=2
             )
-            self.conv = DoubleConv(in_channels, out_channels)
+        
+        # After concatenation, we have in_channels, output to out_channels
+        self.conv = DoubleConv(in_channels, out_channels)
     
     def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
         """
@@ -177,28 +179,36 @@ class ResidualNoiseUNet(nn.Module):
         # Initial convolution
         self.inc = DoubleConv(in_channels, base_channels)
         
+        # Build channel list for encoder
+        # e.g., depth=4, base=32: [32, 64, 128, 256, 512]
+        self.encoder_channels = [base_channels]
+        for i in range(depth):
+            self.encoder_channels.append(self.encoder_channels[-1] * 2)
+        
         # Encoder path
         self.encoders = nn.ModuleList()
-        channels = base_channels
         for i in range(depth):
-            out_ch = channels * 2
-            self.encoders.append(Down(channels, out_ch))
-            channels = out_ch
+            self.encoders.append(Down(self.encoder_channels[i], self.encoder_channels[i+1]))
         
         # Decoder path
+        # Each decoder takes concatenated (upsampled + skip) and outputs to next level
         self.decoders = nn.ModuleList()
-        factor = 2 if bilinear else 1
         for i in range(depth):
-            in_ch = channels
-            out_ch = channels // 2 if i < depth - 1 else channels // 2
-            self.decoders.append(Up(in_ch + in_ch // 2, out_ch // factor, bilinear))
-            channels = out_ch // factor
+            # Input: current decoder channels + skip channels
+            dec_in = self.encoder_channels[depth - i]  # From bottleneck upward
+            skip_ch = self.encoder_channels[depth - i - 1]  # Skip from encoder
+            dec_out = skip_ch  # Output matches skip level
+            self.decoders.append(Up(dec_in + skip_ch, dec_out, bilinear))
         
         # Output layer
         self.outc = nn.Conv2d(base_channels, out_channels, kernel_size=1)
         
         # Initialize weights
         self._init_weights()
+        
+        # Print architecture summary
+        print(f"  Encoder channels: {self.encoder_channels}")
+        print(f"  Decoder: {self.encoder_channels[-1]} -> {base_channels}")
     
     def _init_weights(self):
         """Initialize network weights."""

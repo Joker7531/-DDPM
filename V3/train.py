@@ -334,12 +334,12 @@ def main():
         'depth': 4,
         
         # Data
-        'dataset_root': '../Dataset_STFT',
+        'dataset_root': 'Dataset_STFT',
         'segment_length': 625,  # ~20s @ hop=32, fs=500
-        'stride': 312,          # ~10s stride (50% overlap)
+        'stride': 156,          # ~10s stride (50% overlap)
         
         # Training
-        'batch_size': 8,
+        'batch_size': 16,
         'num_epochs': 200,
         'learning_rate': 1e-4,
         'weight_decay': 1e-5,
@@ -351,9 +351,9 @@ def main():
         'gamma': 0.5,  # Log-mag loss
         
         # Output
-        'output_dir': '../output_V3',
+        'output_dir': './output_V3',
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-        'num_workers': 0
+        'num_workers': 4
     }
     
     print("=" * 70)
