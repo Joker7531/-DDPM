@@ -219,7 +219,8 @@ class STFTSlicingDataset(Dataset):
     
     def _normalize_amplitude_phase(
         self,
-        data: np.ndarray
+        data: np.ndarray,
+        debug: bool = False
     ) -> Tuple[np.ndarray, np.ndarray, float, float]:
         """
         幅度-相位分离归一化
@@ -229,6 +230,7 @@ class STFTSlicingDataset(Dataset):
         
         Args:
             data: 形状 [2, F, T]，Channel 0=Real, 1=Imag
+            debug: 是否打印调试信息
             
         Returns:
             (normalized_data, phase, mean, std):
@@ -240,22 +242,37 @@ class STFTSlicingDataset(Dataset):
         # 1. 计算幅度
         magnitude = self._compute_magnitude(data)  # [F, T]
         
+        if debug:
+            print(f"[DEBUG] 原始幅度 - mean: {np.mean(magnitude):.6f}, std: {np.std(magnitude):.6f}, max: {np.max(magnitude):.6f}")
+        
         # 2. 提取单位相位向量 (保持相位信息)
         safe_magnitude = np.maximum(magnitude, self.eps)
         phase = np.zeros_like(data)
         phase[0] = data[0] / safe_magnitude  # cos(theta)
         phase[1] = data[1] / safe_magnitude  # sin(theta)
         
-        # 3. Log变换幅度
-        log_magnitude = np.log1p(magnitude)  # log(1 + |S|)
+        # 3. Log变换幅度 - 使用 log(|S|) 而不是 log1p(|S|)
+        # 对于很小的幅度，log1p(x) ≈ x，会导致 Z-score 后仍然很小
+        # 使用 log(max(|S|, eps)) 可以将小值映射到负数，增大动态范围
+        log_magnitude = np.log(np.maximum(magnitude, self.eps))
+        
+        if debug:
+            print(f"[DEBUG] Log幅度 - mean: {np.mean(log_magnitude):.6f}, std: {np.std(log_magnitude):.6f}")
         
         # 4. 计算统计量
         mean = float(np.mean(log_magnitude))
         std = float(np.std(log_magnitude))
-        std = max(std, 0.01)  # 保护标准差
+        # 使用非常小的阈值保护，允许真实的 std 被使用
+        std = max(std, 1e-6)
+        
+        if debug:
+            print(f"[DEBUG] 归一化参数 - mean: {mean:.6f}, std: {std:.6f}")
         
         # 5. Z-score 归一化
         norm_log_mag = (log_magnitude - mean) / std  # [F, T]
+        
+        if debug:
+            print(f"[DEBUG] Z-score后 - mean: {np.mean(norm_log_mag):.6f}, std: {np.std(norm_log_mag):.6f}")
         
         # 6. 限制范围防止极端值
         norm_log_mag = np.clip(norm_log_mag, -10.0, 10.0)
@@ -264,6 +281,10 @@ class STFTSlicingDataset(Dataset):
         normalized_data = np.zeros_like(data)
         normalized_data[0] = norm_log_mag * phase[0]  # Real
         normalized_data[1] = norm_log_mag * phase[1]  # Imag
+        
+        if debug:
+            final_mag = np.sqrt(normalized_data[0]**2 + normalized_data[1]**2 + self.eps)
+            print(f"[DEBUG] 最终数据幅度 - mean: {np.mean(final_mag):.6f}, std: {np.std(final_mag):.6f}")
         
         # 8. 检查并处理NaN/Inf
         if not np.isfinite(normalized_data).all():
@@ -309,7 +330,8 @@ class STFTSlicingDataset(Dataset):
         clean_phase[1] = clean_slice[1] / safe_clean_mag
         
         # 2. 使用 raw 的 mean/std 对 clean 幅度做归一化
-        clean_log_mag = np.log1p(clean_magnitude)
+        # 注意：使用 log() 而不是 log1p()，与 _normalize_amplitude_phase 保持一致
+        clean_log_mag = np.log(np.maximum(clean_magnitude, self.eps))
         clean_norm_log_mag = (clean_log_mag - raw_mean) / raw_std
         clean_norm_log_mag = np.clip(clean_norm_log_mag, -10.0, 10.0)
         

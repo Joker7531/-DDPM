@@ -127,13 +127,13 @@ class STFTInferenceProcessor:
         phase[0] = data[0] / safe_magnitude  # cos(theta)
         phase[1] = data[1] / safe_magnitude  # sin(theta)
         
-        # Log变换
-        log_magnitude = np.log1p(magnitude)
+        # Log变换 - 使用 log() 而不是 log1p()，与训练保持一致
+        log_magnitude = np.log(np.maximum(magnitude, self.eps))
         
         # 计算统计量
         mean = float(np.mean(log_magnitude))
         std = float(np.std(log_magnitude))
-        std = max(std, 0.01)
+        std = max(std, 1e-6)  # 使用小的保护值
         
         # Z-score 归一化
         norm_log_mag = (log_magnitude - mean) / std
@@ -164,14 +164,14 @@ class STFTInferenceProcessor:
         反归一化：从归一化域恢复到原始STFT域
         
         归一化过程:
-            log_mag = log1p(|S|)
+            log_mag = log(|S|)
             norm_log_mag = (log_mag - mean) / std
             S_norm = norm_log_mag * phase
         
         反归一化过程:
             1. 从 denoised_norm 提取归一化幅度 (取模)
             2. 反 Z-score: norm_log_mag * std + mean -> log_mag
-            3. 反 log1p: expm1(log_mag) -> magnitude
+            3. 反 log: exp(log_mag) -> magnitude
             4. 用去噪幅度和原始相位重建复数STFT
         
         Args:
@@ -201,9 +201,9 @@ class STFTInferenceProcessor:
         # 3. 反 Z-score: 恢复 log_magnitude
         log_magnitude = norm_log_mag * std + mean
         
-        # 4. 反 log1p: 恢复原始幅度
-        # log_magnitude = log(1 + |S|) -> |S| = exp(log_magnitude) - 1
-        magnitude = np.expm1(log_magnitude)
+        # 4. 反 log: 恢复原始幅度
+        # log_magnitude = log(|S|) -> |S| = exp(log_magnitude)
+        magnitude = np.exp(log_magnitude)
         magnitude = np.maximum(magnitude, 0)  # 确保非负
         
         # 5. 使用原始相位重建复数STFT
