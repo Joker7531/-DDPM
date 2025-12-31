@@ -217,56 +217,61 @@ class STFTSlicingDataset(Dataset):
         magnitude = np.sqrt(real**2 + imag**2 + self.eps)
         return magnitude
     
-    def _anti_identity_normalize(
+    def _normalize_amplitude_phase(
         self,
         data: np.ndarray
-    ) -> Tuple[np.ndarray, float, float]:
+    ) -> Tuple[np.ndarray, np.ndarray, float, float]:
         """
-        抗恒等映射归一化
+        幅度-相位分离归一化
         
-        对数据进行Log变换后的Z-score归一化，
-        并将归一化系数应用回复数实虚部以保持相位比例。
+        将复数STFT分解为幅度和相位，只对幅度进行 log + Z-score 归一化。
+        相位保持不变，便于反归一化。
         
         Args:
             data: 形状 [2, F, T]，Channel 0=Real, 1=Imag
             
         Returns:
-            (normalized_data, mean, std): 归一化后的数据及统计量
+            (normalized_data, phase, mean, std):
+                - normalized_data: 归一化后的数据 [2, F, T]
+                - phase: 单位相位向量 [2, F, T]
+                - mean: log幅度均值
+                - std: log幅度标准差
         """
         # 1. 计算幅度
         magnitude = self._compute_magnitude(data)  # [F, T]
         
-        # 2. Log变换
+        # 2. 提取单位相位向量 (保持相位信息)
+        safe_magnitude = np.maximum(magnitude, self.eps)
+        phase = np.zeros_like(data)
+        phase[0] = data[0] / safe_magnitude  # cos(theta)
+        phase[1] = data[1] / safe_magnitude  # sin(theta)
+        
+        # 3. Log变换幅度
         log_magnitude = np.log1p(magnitude)  # log(1 + |S|)
         
-        # 3. 计算统计量
+        # 4. 计算统计量
         mean = float(np.mean(log_magnitude))
         std = float(np.std(log_magnitude))
-        # 强化标准差保护，避免过小值
-        std = max(std, self.eps * 10)
+        std = max(std, 0.01)  # 保护标准差
         
-        # 4. 计算归一化因子
-        # 归一化后的log幅度: (log_mag - mean) / std
-        norm_factor = (log_magnitude - mean) / std  # [F, T]
+        # 5. Z-score 归一化
+        norm_log_mag = (log_magnitude - mean) / std  # [F, T]
         
-        # 5. 计算缩放因子，添加强化保护
-        # 避免 log_magnitude 过小导致的数值不稳定
-        safe_log_mag = np.maximum(log_magnitude, self.eps)
-        scale = norm_factor / safe_log_mag  # [F, T]
+        # 6. 限制范围防止极端值
+        norm_log_mag = np.clip(norm_log_mag, -10.0, 10.0)
         
-        # 6. 限制缩放因子范围，防止极端值
-        scale = np.clip(scale, -100.0, 100.0)
-        
+        # 7. 重建归一化数据: 归一化幅度 * 单位相位
         normalized_data = np.zeros_like(data)
-        normalized_data[0] = data[0] * scale  # Real
-        normalized_data[1] = data[1] * scale  # Imag
+        normalized_data[0] = norm_log_mag * phase[0]  # Real
+        normalized_data[1] = norm_log_mag * phase[1]  # Imag
         
-        # 7. 检查并处理NaN/Inf
+        # 8. 检查并处理NaN/Inf
         if not np.isfinite(normalized_data).all():
-            # 回退到简单归一化
             normalized_data = np.nan_to_num(normalized_data, nan=0.0, posinf=0.0, neginf=0.0)
+        if not np.isfinite(phase).all():
+            phase = np.nan_to_num(phase, nan=0.0, posinf=0.0, neginf=0.0)
         
-        return normalized_data, mean, std
+        return normalized_data, phase, mean, std
     
     def __len__(self) -> int:
         """返回数据集切片总数"""
@@ -292,33 +297,32 @@ class STFTSlicingDataset(Dataset):
         # 加载切片
         raw_slice, clean_slice = self._load_slice(raw_file, clean_file, start_idx)
         
-        # 抗恒等映射归一化
-        raw_norm, raw_mean, raw_std = self._anti_identity_normalize(raw_slice)
+        # 幅度-相位分离归一化 (使用 raw 的统计量)
+        raw_norm, raw_phase, raw_mean, raw_std = self._normalize_amplitude_phase(raw_slice)
         
-        # 对clean使用相同的统计量进行归一化（保持一致性）
-        # 计算clean的幅度和log变换
+        # 对 clean 使用相同的统计量进行归一化
+        # 1. 计算 clean 的幅度和相位
         clean_magnitude = self._compute_magnitude(clean_slice)
+        safe_clean_mag = np.maximum(clean_magnitude, self.eps)
+        clean_phase = np.zeros_like(clean_slice)
+        clean_phase[0] = clean_slice[0] / safe_clean_mag
+        clean_phase[1] = clean_slice[1] / safe_clean_mag
+        
+        # 2. 使用 raw 的 mean/std 对 clean 幅度做归一化
         clean_log_mag = np.log1p(clean_magnitude)
+        clean_norm_log_mag = (clean_log_mag - raw_mean) / raw_std
+        clean_norm_log_mag = np.clip(clean_norm_log_mag, -10.0, 10.0)
         
-        # 使用raw的mean和std归一化clean
-        clean_norm_factor = (clean_log_mag - raw_mean) / raw_std
-        
-        # 安全计算缩放因子
-        safe_clean_log_mag = np.maximum(clean_log_mag, self.eps)
-        clean_scale = clean_norm_factor / safe_clean_log_mag
-        
-        # 限制缩放因子范围
-        clean_scale = np.clip(clean_scale, -100.0, 100.0)
-        
+        # 3. 重建归一化的 clean: 归一化幅度 * 相位
         clean_norm = np.zeros_like(clean_slice)
-        clean_norm[0] = clean_slice[0] * clean_scale
-        clean_norm[1] = clean_slice[1] * clean_scale
+        clean_norm[0] = clean_norm_log_mag * clean_phase[0]
+        clean_norm[1] = clean_norm_log_mag * clean_phase[1]
         
         # 检查并处理NaN/Inf
         if not np.isfinite(clean_norm).all():
             clean_norm = np.nan_to_num(clean_norm, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # 计算残差目标: Noise = Raw - Clean
+        # 计算残差目标: Noise = Raw - Clean (在归一化域)
         noise_norm = raw_norm - clean_norm
         
         # 检查并处理NaN/Inf

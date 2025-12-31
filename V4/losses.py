@@ -117,8 +117,9 @@ class CompositeLoss(nn.Module):
         """
         计算信号重建损失 (L_reconstruct)
         
-        计算重建信号的 Log-Magnitude L1 损失。
-        目的: 强迫去除噪声后的信号在频谱纹理上逼近纯净信号。
+        在归一化域直接计算幅度 L1 损失。
+        由于新的归一化格式是 normalized_data = norm_log_mag * phase，
+        幅度 |normalized_data| = |norm_log_mag|（因为|phase|=1）
         
         Args:
             raw_input: 原始输入 (归一化后) [B, 2, F, T]
@@ -128,15 +129,16 @@ class CompositeLoss(nn.Module):
         Returns:
             信号重建损失标量
         """
-        # 计算重建信号: Clean_Rec = Raw_Input - Noise_Pred
+        # 计算重建信号: Clean_Rec = Raw_Input - Noise_Pred (归一化域)
         clean_reconstructed = raw_input - noise_pred
         
-        # 计算 Log-Magnitude
-        log_mag_pred = self.compute_log_magnitude(clean_reconstructed)
-        log_mag_target = self.compute_log_magnitude(clean_target)
+        # 在归一化域，幅度就是归一化后的log幅度
+        # 直接计算幅度L1损失
+        mag_pred = self.compute_magnitude(clean_reconstructed)
+        mag_target = self.compute_magnitude(clean_target)
         
         # L1 损失
-        return self.l1_loss(log_mag_pred, log_mag_target)
+        return self.l1_loss(mag_pred, mag_target)
     
     def forward(
         self,

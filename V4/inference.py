@@ -108,18 +108,24 @@ class STFTInferenceProcessor:
     def _normalize_slice(
         self,
         data: np.ndarray
-    ) -> Tuple[np.ndarray, float, float]:
+    ) -> Tuple[np.ndarray, np.ndarray, float, float]:
         """
-        对切片进行抗恒等映射归一化
+        幅度-相位分离归一化 (与训练时一致)
         
         Args:
             data: 形状 [2, F, T]
             
         Returns:
-            (normalized_data, mean, std)
+            (normalized_data, phase, mean, std)
         """
         # 计算幅度
-        magnitude = self._compute_magnitude(data)
+        magnitude = self._compute_magnitude(data)  # [F, T]
+        
+        # 提取单位相位向量
+        safe_magnitude = np.maximum(magnitude, self.eps)
+        phase = np.zeros_like(data)
+        phase[0] = data[0] / safe_magnitude  # cos(theta)
+        phase[1] = data[1] / safe_magnitude  # sin(theta)
         
         # Log变换
         log_magnitude = np.log1p(magnitude)
@@ -127,30 +133,30 @@ class STFTInferenceProcessor:
         # 计算统计量
         mean = float(np.mean(log_magnitude))
         std = float(np.std(log_magnitude))
-        std = max(std, self.eps * 10)
+        std = max(std, 0.01)
         
-        # 计算归一化因子
-        norm_factor = (log_magnitude - mean) / std
+        # Z-score 归一化
+        norm_log_mag = (log_magnitude - mean) / std
+        norm_log_mag = np.clip(norm_log_mag, -10.0, 10.0)
         
-        # 安全计算缩放因子
-        safe_log_mag = np.maximum(log_magnitude, self.eps)
-        scale = norm_factor / safe_log_mag
-        scale = np.clip(scale, -100.0, 100.0)
-        
+        # 重建归一化数据: 归一化幅度 * 单位相位
         normalized_data = np.zeros_like(data)
-        normalized_data[0] = data[0] * scale
-        normalized_data[1] = data[1] * scale
+        normalized_data[0] = norm_log_mag * phase[0]
+        normalized_data[1] = norm_log_mag * phase[1]
         
         # 处理NaN/Inf
         if not np.isfinite(normalized_data).all():
             normalized_data = np.nan_to_num(normalized_data, nan=0.0, posinf=0.0, neginf=0.0)
+        if not np.isfinite(phase).all():
+            phase = np.nan_to_num(phase, nan=0.0, posinf=0.0, neginf=0.0)
         
-        return normalized_data, mean, std
+        return normalized_data, phase, mean, std
     
     def _denormalize_slice(
         self,
         denoised_norm: np.ndarray,
         raw_slice: np.ndarray,
+        phase: np.ndarray,
         mean: float,
         std: float
     ) -> np.ndarray:
@@ -159,63 +165,51 @@ class STFTInferenceProcessor:
         
         归一化过程:
             log_mag = log1p(|S|)
-            norm_factor = (log_mag - mean) / std
-            scale = norm_factor / log_mag
-            S_norm = S * scale
+            norm_log_mag = (log_mag - mean) / std
+            S_norm = norm_log_mag * phase
         
         反归一化过程:
-            1. 从去噪后的归一化数据计算幅度 |S_norm|
-            2. 由于 scale = norm_factor / log_mag，且 |S_norm| = |S| * |scale|
-               我们需要找到原始幅度 |S|
-            3. 使用迭代或直接求解来恢复
-        
-        简化策略：使用原始raw的相位，只修改幅度
+            1. 从 denoised_norm 提取归一化幅度 (取模)
+            2. 反 Z-score: norm_log_mag * std + mean -> log_mag
+            3. 反 log1p: expm1(log_mag) -> magnitude
+            4. 用去噪幅度和原始相位重建复数STFT
         
         Args:
             denoised_norm: 归一化域的去噪结果 [2, F, T]
-            raw_slice: 原始STFT切片 [2, F, T] (未归一化)
+            raw_slice: 原始STFT切片 [2, F, T] (用于提取相位)
+            phase: 原始数据的单位相位向量 [2, F, T]
             mean: 归一化时的均值
             std: 归一化时的标准差
             
         Returns:
             反归一化后的STFT切片 [2, F, T]
         """
-        # 计算去噪后归一化数据的幅度
-        denoised_mag_norm = self._compute_magnitude(denoised_norm)  # |S_denoised_norm|
+        # 1. 从去噪结果提取归一化后的log幅度
+        # denoised_norm = norm_log_mag * phase
+        # |denoised_norm| = |norm_log_mag| (因为 |phase| = 1)
+        denoised_norm_mag = self._compute_magnitude(denoised_norm)
         
-        # 计算原始数据的幅度和log幅度
-        raw_magnitude = self._compute_magnitude(raw_slice)  # |S_raw|
-        raw_log_mag = np.log1p(raw_magnitude)
+        # 2. 确定符号：检查去噪结果与相位的方向是否一致
+        # 如果 denoised_norm 与 phase 同向，norm_log_mag > 0
+        # 如果 denoised_norm 与 phase 反向，norm_log_mag < 0
+        dot_product = denoised_norm[0] * phase[0] + denoised_norm[1] * phase[1]
+        sign = np.sign(dot_product)
+        sign = np.where(sign == 0, 1.0, sign)  # 处理零值
         
-        # 计算原始数据归一化时的scale
-        raw_norm_factor = (raw_log_mag - mean) / std
-        safe_raw_log_mag = np.maximum(raw_log_mag, self.eps)
-        raw_scale = np.clip(raw_norm_factor / safe_raw_log_mag, -100.0, 100.0)
+        norm_log_mag = denoised_norm_mag * sign
         
-        # 原始归一化幅度: |S_raw_norm| = |S_raw| * |scale|
-        raw_mag_norm = raw_magnitude * np.abs(raw_scale)
+        # 3. 反 Z-score: 恢复 log_magnitude
+        log_magnitude = norm_log_mag * std + mean
         
-        # 计算幅度比例: denoised/raw (在归一化域)
-        safe_raw_mag_norm = np.maximum(raw_mag_norm, self.eps)
-        magnitude_ratio = denoised_mag_norm / safe_raw_mag_norm
+        # 4. 反 log1p: 恢复原始幅度
+        # log_magnitude = log(1 + |S|) -> |S| = exp(log_magnitude) - 1
+        magnitude = np.expm1(log_magnitude)
+        magnitude = np.maximum(magnitude, 0)  # 确保非负
         
-        # 限制比例范围，避免极端放大
-        magnitude_ratio = np.clip(magnitude_ratio, 0.0, 10.0)
-        
-        # 将比例应用到原始幅度上
-        denoised_magnitude = raw_magnitude * magnitude_ratio
-        
-        # 从原始raw提取相位 (单位相位向量)
-        raw_real = raw_slice[0]
-        raw_imag = raw_slice[1]
-        safe_raw_magnitude = np.maximum(raw_magnitude, self.eps)
-        phase_real = raw_real / safe_raw_magnitude
-        phase_imag = raw_imag / safe_raw_magnitude
-        
-        # 用去噪幅度和原始相位重建复数STFT
+        # 5. 使用原始相位重建复数STFT
         denoised_stft = np.zeros_like(raw_slice)
-        denoised_stft[0] = denoised_magnitude * phase_real  # Real
-        denoised_stft[1] = denoised_magnitude * phase_imag  # Imag
+        denoised_stft[0] = magnitude * phase[0]  # Real
+        denoised_stft[1] = magnitude * phase[1]  # Imag
         
         return denoised_stft
     
@@ -285,8 +279,8 @@ class STFTInferenceProcessor:
             raw_slice_full = raw_stft[:, :, start_idx:end_idx]  # [2, 257, window]
             raw_slice = raw_slice_full[:, self.freq_start:self.freq_end, :]  # [2, 103, window]
             
-            # 2. 归一化
-            raw_norm, mean, std = self._normalize_slice(raw_slice)
+            # 2. 归一化 (幅度-相位分离)
+            raw_norm, phase, mean, std = self._normalize_slice(raw_slice)
             
             # 调试：第一个切片打印详细信息
             if debug and i == 0:
@@ -320,16 +314,13 @@ class STFTInferenceProcessor:
                 print(f"[DEBUG] 切片0 denoised_norm范围: [{denoised_norm.min():.4f}, {denoised_norm.max():.4f}]")
             
             # 5. 反归一化
-            denoised_slice = self._denormalize_slice(denoised_norm, raw_slice, mean, std)
+            denoised_slice = self._denormalize_slice(denoised_norm, raw_slice, phase, mean, std)
             
             if debug and i == 0:
                 denoised_mag = np.sqrt(denoised_slice[0]**2 + denoised_slice[1]**2)
                 raw_mag = np.sqrt(raw_slice[0]**2 + raw_slice[1]**2)
                 print(f"[DEBUG] 切片0 反归一化后幅度范围: [{denoised_mag.min():.4f}, {denoised_mag.max():.4f}]")
                 print(f"[DEBUG] 切片0 原始幅度范围: [{raw_mag.min():.4f}, {raw_mag.max():.4f}]")
-            
-            # 5. 反归一化
-            denoised_slice = self._denormalize_slice(denoised_norm, raw_slice, mean, std)
             
             # 6. 填充回原始频率维度
             denoised_slice_full = self._pad_frequency(denoised_slice)
@@ -353,7 +344,7 @@ class STFTInferenceProcessor:
             raw_slice_full = raw_stft[:, :, start_idx:end_idx]
             raw_slice = raw_slice_full[:, self.freq_start:self.freq_end, :]
             
-            raw_norm, mean, std = self._normalize_slice(raw_slice)
+            raw_norm, phase, mean, std = self._normalize_slice(raw_slice)
             raw_tensor = torch.from_numpy(raw_norm).float().unsqueeze(0).to(self.device)
             noise_pred = self.model(raw_tensor)
             noise_pred = noise_pred.squeeze(0).cpu().numpy()
@@ -367,7 +358,7 @@ class STFTInferenceProcessor:
             if ratio < 0.01:
                 denoised_norm = raw_norm.copy()
             
-            denoised_slice = self._denormalize_slice(denoised_norm, raw_slice, mean, std)
+            denoised_slice = self._denormalize_slice(denoised_norm, raw_slice, phase, mean, std)
             denoised_slice_full = self._pad_frequency(denoised_slice)
             denoised_slice_full[:, :self.freq_start, :] = raw_slice_full[:, :self.freq_start, :]
             denoised_slice_full[:, self.freq_end:, :] = raw_slice_full[:, self.freq_end:, :]

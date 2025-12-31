@@ -51,3 +51,15 @@ python train.py \
     --batch_size 32 \
     --lr 1e-3
 ```
+归一化：
+1. magnitude = |S|
+2. phase = S / |S|  (单位相位向量，保持不变)
+3. log_mag = log1p(magnitude)
+4. norm_log_mag = (log_mag - mean) / std  (Z-score)
+5. S_norm = norm_log_mag * phase
+
+反归一化：
+1. norm_log_mag = |S_norm| * sign  (恢复符号)
+2. log_mag = norm_log_mag * std + mean
+3. magnitude = expm1(log_mag)
+4. S = magnitude * phase
