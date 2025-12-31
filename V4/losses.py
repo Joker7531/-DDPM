@@ -32,9 +32,13 @@ class CompositeLoss(nn.Module):
         - L_noise: 预测噪声与真实噪声的 L1 损失 (实部和虚部分别计算)
         - L_reconstruct: 重建信号的 Log-Magnitude L1 损失
     
+    注意: 由于数据经过 Z-score 归一化，损失值会较小。
+    使用 loss_scale 参数可以放大损失值以便于监控。
+    
     Args:
         noise_weight: 噪声拟合项权重 (默认 1.0)
         reconstruct_weight: 信号重建项权重 (默认 1.0)
+        loss_scale: 损失缩放因子 (默认 100.0，用于放大小数值)
         eps: 数值稳定性常数 (默认 1e-8)
     """
     
@@ -42,12 +46,14 @@ class CompositeLoss(nn.Module):
         self,
         noise_weight: float = 1.0,
         reconstruct_weight: float = 1.0,
+        loss_scale: float = 100.0,
         eps: float = 1e-8
     ) -> None:
         super().__init__()
         
         self.noise_weight = noise_weight
         self.reconstruct_weight = reconstruct_weight
+        self.loss_scale = loss_scale
         self.eps = eps
         
         # L1 损失函数
@@ -169,19 +175,21 @@ class CompositeLoss(nn.Module):
         # 2. 信号重建损失
         l_reconstruct = self.reconstruction_loss(raw_input, noise_pred, clean_target)
         
-        # 3. 加权总损失
-        total_loss = self.noise_weight * l_noise + self.reconstruct_weight * l_reconstruct
+        # 3. 加权总损失 (应用缩放因子使损失值更易读)
+        total_loss = self.loss_scale * (
+            self.noise_weight * l_noise + self.reconstruct_weight * l_reconstruct
+        )
         
         # 4. 损失值安全检查
         if not torch.isfinite(total_loss):
             # 回退到仅噪声损失
-            total_loss = l_noise if torch.isfinite(l_noise) else torch.tensor(0.0, device=noise_pred.device, requires_grad=True)
+            total_loss = self.loss_scale * l_noise if torch.isfinite(l_noise) else torch.tensor(0.0, device=noise_pred.device, requires_grad=True)
         
-        # 损失字典 (用于日志记录)
+        # 损失字典 (用于日志记录, 使用缩放后的值)
         loss_dict = {
             'total': total_loss.detach(),
-            'noise': l_noise.detach(),
-            'reconstruct': l_reconstruct.detach()
+            'noise': (self.loss_scale * l_noise).detach(),
+            'reconstruct': (self.loss_scale * l_reconstruct).detach()
         }
         
         return total_loss, loss_dict

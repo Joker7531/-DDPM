@@ -173,6 +173,67 @@ class Trainer:
         # Warmup 参数
         self.warmup_epochs = config.get('warmup_epochs', 5)
         self.base_lr = config.get('lr', 1e-4)
+        
+        # 诊断标志
+        self._diagnosed = False
+    
+    def _diagnose_data(self, batch: Dict[str, torch.Tensor]) -> None:
+        """
+        诊断数据分布，输出统计信息
+        
+        Args:
+            batch: 包含 input, target, clean_norm 的数据批次
+        """
+        if self._diagnosed:
+            return
+        
+        self._diagnosed = True
+        
+        input_data = batch['input']
+        target_data = batch['target']
+        clean_data = batch['clean_norm']
+        
+        self.logger.info("=" * 60)
+        self.logger.info("数据分布诊断")
+        self.logger.info("=" * 60)
+        
+        # 输入统计
+        input_abs_mean = torch.mean(torch.abs(input_data)).item()
+        input_std = torch.std(input_data).item()
+        input_max = torch.max(torch.abs(input_data)).item()
+        self.logger.info(f"INPUT (归一化后的 Raw):")
+        self.logger.info(f"  绝对值均值: {input_abs_mean:.6f}")
+        self.logger.info(f"  标准差: {input_std:.6f}")
+        self.logger.info(f"  最大绝对值: {input_max:.6f}")
+        
+        # 目标统计
+        target_abs_mean = torch.mean(torch.abs(target_data)).item()
+        target_std = torch.std(target_data).item()
+        target_max = torch.max(torch.abs(target_data)).item()
+        self.logger.info(f"TARGET (噪声 = Raw - Clean):")
+        self.logger.info(f"  绝对值均值: {target_abs_mean:.6f}")
+        self.logger.info(f"  标准差: {target_std:.6f}")
+        self.logger.info(f"  最大绝对值: {target_max:.6f}")
+        
+        # Clean 统计
+        clean_abs_mean = torch.mean(torch.abs(clean_data)).item()
+        clean_std = torch.std(clean_data).item()
+        clean_max = torch.max(torch.abs(clean_data)).item()
+        self.logger.info(f"CLEAN (归一化后的干净信号):")
+        self.logger.info(f"  绝对值均值: {clean_abs_mean:.6f}")
+        self.logger.info(f"  标准差: {clean_std:.6f}")
+        self.logger.info(f"  最大绝对值: {clean_max:.6f}")
+        
+        # 噪声/信号比
+        noise_ratio = target_abs_mean / (input_abs_mean + 1e-8)
+        self.logger.info(f"噪声/信号比: {noise_ratio:.4f}")
+        
+        if target_abs_mean < 0.05:
+            self.logger.warning(f"⚠️  噪声目标非常小 (mean={target_abs_mean:.6f})")
+            self.logger.warning("   这可能导致模型输出接近零时 loss 就已很低")
+            self.logger.warning("   建议检查 raw 和 clean 数据是否正确配对")
+        
+        self.logger.info("=" * 60)
     
     def _get_warmup_lr(self, epoch: int, batch_idx: int, num_batches: int) -> float:
         """
@@ -216,6 +277,10 @@ class Trainer:
             raw_norm = batch['input'].to(self.device)       # [B, 2, 103, 156]
             noise_target = batch['target'].to(self.device)  # [B, 2, 103, 156]
             clean_norm = batch['clean_norm'].to(self.device)  # [B, 2, 103, 156]
+            
+            # 首次诊断数据分布
+            if batch_idx == 0:
+                self._diagnose_data(batch)
             
             # 清零梯度
             self.optimizer.zero_grad()
