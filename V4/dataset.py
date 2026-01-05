@@ -48,7 +48,7 @@ class STFTSlicingDataset(Dataset):
         window_size: int = 156,
         train_stride: int = 40,
         eval_stride: int = 156,
-        eps: float = 1e-8
+        eps: float = 1e-5
     ) -> None:
         """
         初始化STFT切片数据集
