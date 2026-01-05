@@ -38,12 +38,16 @@ def compute_and_save_stft(
     sig = np.load(signal_path)
     
     # Compute STFT
+    # 显式指定所有参数以避免版本差异
     f, t, Zxx = signal.stft(
         sig,
         fs=fs,
+        window='hann',      # 显式指定窗函数
         nperseg=nperseg,
         noverlap=noverlap,
         nfft=nfft,
+        boundary='zeros',   # 默认值，显式指定
+        padded=True,        # 默认值，显式指定
         return_onesided=True
     )
     

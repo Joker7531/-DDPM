@@ -330,13 +330,18 @@ class STFTInferenceProcessor:
         complex_stft = real + 1j * imag  # [n_freq, n_frames]
         
         # 使用 scipy.signal.istft（与数据准备时的 stft 对应）
+        # 重要: boundary 参数必须与 stft 时保持一致
+        # stft 默认 boundary='zeros' -> istft 需要 boundary=True
         _, reconstructed = scipy_signal.istft(
             complex_stft,
             fs=self.sample_rate,
             window=window,
             nperseg=self.n_fft,
             noverlap=self.n_fft - self.hop_length,
-            nfft=self.n_fft
+            nfft=self.n_fft,
+            boundary=True,  # 对应 stft 的 boundary='zeros'
+            time_axis=-1,
+            freq_axis=-2
         )
         
         return reconstructed.astype(np.float32)
