@@ -57,7 +57,7 @@ class STFTInferenceProcessor:
         n_fft: int = 512,
         hop_length: int = 64,
         sample_rate: int = 500,
-        eps: float = 1e-5
+        eps: float = 1e-6
     ) -> None:
         self.model = model
         self.device = device

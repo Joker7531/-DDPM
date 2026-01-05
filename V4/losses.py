@@ -47,7 +47,7 @@ class CompositeLoss(nn.Module):
         noise_weight: float = 1.0,
         reconstruct_weight: float = 1.0,
         loss_scale: float = 1.0,
-        eps: float = 1e-5
+        eps: float = 1e-6
     ) -> None:
         super().__init__()
         
@@ -209,7 +209,7 @@ class PSNRMetric:
     def __init__(
         self,
         data_range: Optional[float] = None,
-        eps: float = 1e-5
+        eps: float = 1e-6
     ) -> None:
         self.data_range = data_range
         self.eps = eps
