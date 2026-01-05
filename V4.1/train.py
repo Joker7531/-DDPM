@@ -277,6 +277,10 @@ class Trainer:
             raw_norm = batch['input'].to(self.device)       # [B, 2, 103, 156]
             noise_target = batch['target'].to(self.device)  # [B, 2, 103, 156]
             clean_norm = batch['clean_norm'].to(self.device)  # [B, 2, 103, 156]
+            mean = batch['mean'].to(self.device)            # [B]
+            std = batch['std'].to(self.device)              # [B]
+            raw_slice = batch['raw_slice'].to(self.device)  # [B, 2, 103, 156]
+            clean_slice = batch['clean_slice'].to(self.device)  # [B, 2, 103, 156]
             
             # 首次诊断数据分布
             if batch_idx == 0:
@@ -434,6 +438,10 @@ class Trainer:
             raw_norm = batch['input'].to(self.device)
             noise_target = batch['target'].to(self.device)
             clean_norm = batch['clean_norm'].to(self.device)
+            mean = batch['mean'].to(self.device)
+            std = batch['std'].to(self.device)
+            raw_slice = batch['raw_slice'].to(self.device)
+            clean_slice = batch['clean_slice'].to(self.device)
             mean = batch['mean'].to(self.device)
             std = batch['std'].to(self.device)
             
