@@ -803,9 +803,6 @@ def main():
         n_fft=512,
         hop_length=64
     )
-        use_freq_attention=not args.no_freq_attention,
-        freq_dim=103
-    ).to(device)
     
     # 优化器
     optimizer = AdamW(
