@@ -275,23 +275,31 @@ class STFTSlicingDataset(Dataset):
         if not np.isfinite(clean_norm).all():
             clean_norm = np.nan_to_num(clean_norm, nan=0.0, posinf=0.0, neginf=0.0)
         
+        # 计算残差目标: Noise = Raw - Clean (在归一化域)
+        noise_norm = raw_norm - clean_norm
+        if not np.isfinite(noise_norm).all():
+            noise_norm = np.nan_to_num(noise_norm, nan=0.0, posinf=0.0, neginf=0.0)
+        
         # 转换为 PyTorch 张量
         input_tensor = torch.from_numpy(raw_norm.copy()).float()
-        target_tensor = torch.from_numpy(clean_norm.copy()).float()
+        target_tensor = torch.from_numpy(noise_norm.copy()).float()  # 残差目标
+        clean_norm_tensor = torch.from_numpy(clean_norm.copy()).float()
         raw_tensor = torch.from_numpy(raw_slice.copy()).float()
         clean_tensor = torch.from_numpy(clean_slice.copy()).float()
         
         # 安全检查
         input_tensor = torch.nan_to_num(input_tensor, nan=0.0, posinf=0.0, neginf=0.0)
         target_tensor = torch.nan_to_num(target_tensor, nan=0.0, posinf=0.0, neginf=0.0)
+        clean_norm_tensor = torch.nan_to_num(clean_norm_tensor, nan=0.0, posinf=0.0, neginf=0.0)
         
         return {
-            'input': input_tensor,        # [2, 103, 156] 归一化后的 raw
-            'target': target_tensor,      # [2, 103, 156] 归一化后的 clean (直接预测目标)
+            'input': input_tensor,            # [2, 103, 156] 归一化后的 raw
+            'target': target_tensor,          # [2, 103, 156] 归一化后的噪声残差 (raw - clean)
+            'clean_norm': clean_norm_tensor,  # [2, 103, 156] 归一化后的 clean
             'mean': torch.tensor(raw_mean).float(),
             'std': torch.tensor(raw_std).float(),
-            'raw_slice': raw_tensor,      # [2, 103, 156] 原始 raw (用于 Loss)
-            'clean_slice': clean_tensor   # [2, 103, 156] 原始 clean (用于 Loss)
+            'raw_slice': raw_tensor,          # [2, 103, 156] 原始 raw (用于 Loss)
+            'clean_slice': clean_tensor       # [2, 103, 156] 原始 clean (用于 Loss)
         }
 
 

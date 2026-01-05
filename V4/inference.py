@@ -258,16 +258,22 @@ class STFTInferenceProcessor:
                 print(f"[DEBUG] 切片0 归一化: mean={mean:.4f}, std={std:.4f}")
                 print(f"[DEBUG] 切片0 raw_norm范围: [{raw_norm.min():.4f}, {raw_norm.max():.4f}]")
             
-            # 3. 转换为tensor并推理 (模型直接预测归一化域的 clean)
+            # 3. 转换为tensor并推理 (模型预测噪声残差)
             raw_tensor = torch.from_numpy(raw_norm).float().unsqueeze(0).to(self.device)
-            denoised_norm = self.model(raw_tensor)
-            denoised_norm = denoised_norm.squeeze(0).cpu().numpy()
+            noise_pred = self.model(raw_tensor)
+            noise_pred = noise_pred.squeeze(0).cpu().numpy()
             
             # 调试
             if debug and i == 0:
-                print(f"[DEBUG] 切片0 模型输出范围: [{denoised_norm.min():.4f}, {denoised_norm.max():.4f}]")
+                print(f"[DEBUG] 切片0 模型预测噪声范围: [{noise_pred.min():.4f}, {noise_pred.max():.4f}]")
             
-            # 4. 反归一化
+            # 4. 计算去噪结果 (归一化域): denoised = raw - noise
+            denoised_norm = raw_norm - noise_pred
+            
+            if debug and i == 0:
+                print(f"[DEBUG] 切片0 去噪后归一化范围: [{denoised_norm.min():.4f}, {denoised_norm.max():.4f}]")
+            
+            # 5. 反归一化
             denoised_slice = self._instance_denormalize(denoised_norm, mean, std)
             
             if debug and i == 0:
@@ -298,9 +304,11 @@ class STFTInferenceProcessor:
             
             raw_norm, mean, std = self._instance_normalize(raw_slice)
             raw_tensor = torch.from_numpy(raw_norm).float().unsqueeze(0).to(self.device)
-            denoised_norm = self.model(raw_tensor)
-            denoised_norm = denoised_norm.squeeze(0).cpu().numpy()
+            noise_pred = self.model(raw_tensor)
+            noise_pred = noise_pred.squeeze(0).cpu().numpy()
             
+            # 计算去噪结果: denoised = raw - noise
+            denoised_norm = raw_norm - noise_pred
             denoised_slice = self._instance_denormalize(denoised_norm, mean, std)
             denoised_slice_full = self._pad_frequency(denoised_slice)
             denoised_slice_full[:, :self.freq_start, :] = raw_slice_full[:, :self.freq_start, :]
