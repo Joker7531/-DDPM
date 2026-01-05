@@ -415,7 +415,7 @@ def process_single_file(
     input_path: str,
     output_dir: str,
     processor: STFTInferenceProcessor,
-    save_stft: bool = True,
+    save_stft: bool = False,
     save_signal: bool = True
 ) -> Dict[str, str]:
     """
