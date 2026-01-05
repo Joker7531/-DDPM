@@ -310,6 +310,9 @@ class STFTInferenceProcessor:
         """
         执行逆短时傅里叶变换 (ISTFT)
         
+        使用与 scipy.signal.stft 兼容的方式进行重建。
+        scipy.signal.istft 会自动处理窗函数的能量归一化。
+        
         Args:
             stft_data: STFT数据，形状 [2, n_freq, n_frames]
                        Channel 0=Real, 1=Imag
@@ -318,38 +321,25 @@ class STFTInferenceProcessor:
         Returns:
             重建的一维时域信号
         """
+        # 方案：直接使用 scipy.signal.istft 以匹配数据准备时的 STFT
+        from scipy import signal as scipy_signal
+        
         # 转换为复数形式
         real = stft_data[0]  # [n_freq, n_frames]
         imag = stft_data[1]
         complex_stft = real + 1j * imag  # [n_freq, n_frames]
         
-        # 转换为PyTorch张量
-        stft_tensor = torch.from_numpy(complex_stft).to(torch.complex64)
-        
-        # 创建窗函数
-        if window == 'hann':
-            win = torch.hann_window(self.n_fft)
-        elif window == 'hamming':
-            win = torch.hamming_window(self.n_fft)
-        else:
-            win = torch.ones(self.n_fft)
-        
-        # 执行ISTFT
-        # PyTorch的istft需要输入形状为 [n_freq, n_frames]
-        signal = torch.istft(
-            stft_tensor,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            win_length=self.n_fft,
-            window=win,
-            center=True,
-            normalized=False,
-            onesided=True,
-            length=None,
-            return_complex=False
+        # 使用 scipy.signal.istft（与数据准备时的 stft 对应）
+        _, reconstructed = scipy_signal.istft(
+            complex_stft,
+            fs=self.sample_rate,
+            window=window,
+            nperseg=self.n_fft,
+            noverlap=self.n_fft - self.hop_length,
+            nfft=self.n_fft
         )
         
-        return signal.numpy()
+        return reconstructed.astype(np.float32)
     
     def process_and_reconstruct(
         self,
