@@ -123,66 +123,29 @@ class STFTInferenceProcessor:
         
         return normalized_data, mean, std
     
-    def _denormalize_slice(
+    def _instance_denormalize(
         self,
-        denoised_norm: np.ndarray,
-        raw_slice: np.ndarray,
-        phase: np.ndarray,
+        normalized_data: np.ndarray,
         mean: float,
         std: float
     ) -> np.ndarray:
         """
         反归一化：从归一化域恢复到原始STFT域
         
-        归一化过程:
-            log_mag = log(|S|)
-            norm_log_mag = (log_mag - mean) / std
-            S_norm = norm_log_mag * phase
-        
-        反归一化过程:
-            1. 从 denoised_norm 提取归一化幅度 (取模)
-            2. 反 Z-score: norm_log_mag * std + mean -> log_mag
-            3. 反 log: exp(log_mag) -> magnitude
-            4. 用去噪幅度和原始相位重建复数STFT
+        简单的 Z-score 反变换：data = normalized_data * std + mean
         
         Args:
-            denoised_norm: 归一化域的去噪结果 [2, F, T]
-            raw_slice: 原始STFT切片 [2, F, T] (用于提取相位)
-            phase: 原始数据的单位相位向量 [2, F, T]
+            normalized_data: 归一化域的数据 [2, F, T]
             mean: 归一化时的均值
             std: 归一化时的标准差
             
         Returns:
             反归一化后的STFT切片 [2, F, T]
         """
-        # 1. 从去噪结果提取归一化后的log幅度
-        # denoised_norm = norm_log_mag * phase
-        # |denoised_norm| = |norm_log_mag| (因为 |phase| = 1)
-        denoised_norm_mag = self._compute_magnitude(denoised_norm)
+        # 反 Z-score
+        denormalized = normalized_data * std + mean
         
-        # 2. 确定符号：检查去噪结果与相位的方向是否一致
-        # 如果 denoised_norm 与 phase 同向，norm_log_mag > 0
-        # 如果 denoised_norm 与 phase 反向，norm_log_mag < 0
-        dot_product = denoised_norm[0] * phase[0] + denoised_norm[1] * phase[1]
-        sign = np.sign(dot_product)
-        sign = np.where(sign == 0, 1.0, sign)  # 处理零值
-        
-        norm_log_mag = denoised_norm_mag * sign
-        
-        # 3. 反 Z-score: 恢复 log_magnitude
-        log_magnitude = norm_log_mag * std + mean
-        
-        # 4. 反 log: 恢复原始幅度
-        # log_magnitude = log(|S|) -> |S| = exp(log_magnitude)
-        magnitude = np.exp(log_magnitude)
-        magnitude = np.maximum(magnitude, 0)  # 确保非负
-        
-        # 5. 使用原始相位重建复数STFT
-        denoised_stft = np.zeros_like(raw_slice)
-        denoised_stft[0] = magnitude * phase[0]  # Real
-        denoised_stft[1] = magnitude * phase[1]  # Imag
-        
-        return denoised_stft
+        return denormalized
     
     def _pad_frequency(self, data: np.ndarray) -> np.ndarray:
         """
