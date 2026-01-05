@@ -79,9 +79,6 @@ class STFTSlicingDataset(Dataset):
         
         # 预计算所有切片索引: (raw_file, clean_file, start_idx)
         self.slice_indices: List[Tuple[str, str, int]] = []
-        
-        # 文件级归一化参数缓存: {raw_file: (mean, std)}
-        self.file_norm_params: Dict[str, Tuple[float, float]] = {}
         self._precompute_slice_indices()
         
         print(f"[{self.mode.upper()}] 数据集初始化完成:")
@@ -128,11 +125,10 @@ class STFTSlicingDataset(Dataset):
     
     def _precompute_slice_indices(self) -> None:
         """
-        预计算所有文件的切片索引和文件级归一化参数
+        预计算所有文件的切片索引
         
         遍历所有文件，根据时间维度长度和滑动窗口参数，
         计算每个有效切片的(raw文件名, clean文件名, 起始帧索引)元组。
-        同时计算每个文件的归一化参数（mean, std）并缓存。
         """
         file_pairs = self._get_file_list()
         
@@ -152,53 +148,12 @@ class STFTSlicingDataset(Dataset):
                 print(f"警告: 文件 {raw_file} 时间维度 {t_length} 小于窗口大小 {self.window_size}，跳过")
                 continue
             
-            # 计算并缓存文件级归一化参数
-            # 对整个文件（裁剪频域后）计算统计量
-            data_cropped = data[:, self.freq_start:self.freq_end, :]  # [2, 103, T]
-            file_mean, file_std = self._compute_file_norm_params(data_cropped)
-            self.file_norm_params[raw_file] = (file_mean, file_std)
-            
             # 滑动窗口切片
             num_slices = (t_length - self.window_size) // self.stride + 1
             
             for i in range(num_slices):
                 start_idx = i * self.stride
                 self.slice_indices.append((raw_file, clean_file, start_idx))
-    
-    def _compute_file_norm_params(self, data: np.ndarray) -> Tuple[float, float]:
-        """
-        计算整个文件的归一化参数（mean, std）
-        
-        对整个文件的log幅度计算全局统计量，用于文件级归一化。
-        
-        Args:
-            data: 频域裁剪后的数据，形状 [2, F, T]
-            
-        Returns:
-            (mean, std): 文件级的log幅度均值和标准差
-        """
-        # 处理 NaN 和 Inf
-        if not np.isfinite(data).all():
-            data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        # 限制极端值
-        max_val = 1e6
-        data = np.clip(data, -max_val, max_val)
-        
-        # 计算幅度
-        real = data[0]  # [F, T]
-        imag = data[1]  # [F, T]
-        magnitude = np.sqrt(real**2 + imag**2 + self.eps)  # [F, T]
-        
-        # Log变换
-        log_magnitude = np.log(np.maximum(magnitude, self.eps))
-        
-        # 计算全局统计量
-        mean = float(np.mean(log_magnitude))
-        std = float(np.std(log_magnitude))
-        std = max(std, 1e-6)  # 防止除零
-        
-        return mean, std
     
     def _load_slice(
         self,
@@ -247,91 +202,41 @@ class STFTSlicingDataset(Dataset):
         
         return raw_slice, clean_slice
     
-    def _compute_magnitude(self, data: np.ndarray) -> np.ndarray:
-        """
-        计算复数STFT的幅度
-        
-        Args:
-            data: 形状 [2, F, T]，Channel 0=Real, 1=Imag
-            
-        Returns:
-            幅度数组，形状 [F, T]
-        """
-        real = data[0]  # [F, T]
-        imag = data[1]  # [F, T]
-        magnitude = np.sqrt(real**2 + imag**2 + self.eps)
-        return magnitude
-    
-    def _normalize_amplitude_phase(
+    def _instance_normalize(
         self,
-        data: np.ndarray,
-        file_mean: float,
-        file_std: float,
-        debug: bool = False
-    ) -> Tuple[np.ndarray, np.ndarray]:
+        data: np.ndarray
+    ) -> Tuple[np.ndarray, float, float]:
         """
-        幅度-相位分离归一化（使用文件级统计量）
+        Instance Normalization: 对单个切片直接进行 Z-score 归一化
         
-        将复数STFT分解为幅度和相位，使用文件级的 mean/std 进行 log + Z-score 归一化。
-        相位保持不变，便于反归一化。
+        直接对 Real/Imag 通道进行操作，不做幅度-相位分离，不做 Log 变换。
+        输入端保持线性缩放，Log 压缩放到 Loss Function 中处理。
         
         Args:
             data: 形状 [2, F, T]，Channel 0=Real, 1=Imag
-            file_mean: 文件级的log幅度均值
-            file_std: 文件级的log幅度标准差
-            debug: 是否打印调试信息
             
         Returns:
-            (normalized_data, phase):
+            (normalized_data, mean, std):
                 - normalized_data: 归一化后的数据 [2, F, T]
-                - phase: 单位相位向量 [2, F, T]
+                - mean: 该切片的均值 (标量)
+                - std: 该切片的标准差 (标量)
         """
-        # 1. 计算幅度
-        magnitude = self._compute_magnitude(data)  # [F, T]
+        # 计算整个切片的统计量 (跨 Real/Imag 和所有频率、时间)
+        mean = float(np.mean(data))
+        std = float(np.std(data))
+        std = max(std, self.eps)  # 防止除零
         
-        if debug:
-            print(f"[DEBUG] 原始幅度 - mean: {np.mean(magnitude):.6f}, std: {np.std(magnitude):.6f}, max: {np.max(magnitude):.6f}")
+        # Z-score 归一化
+        normalized_data = (data - mean) / std
         
-        # 2. 提取单位相位向量 (保持相位信息)
-        safe_magnitude = np.maximum(magnitude, self.eps)
-        phase = np.zeros_like(data)
-        phase[0] = data[0] / safe_magnitude  # cos(theta)
-        phase[1] = data[1] / safe_magnitude  # sin(theta)
+        # 限制范围防止极端值
+        normalized_data = np.clip(normalized_data, -10.0, 10.0)
         
-        # 3. Log变换幅度 - 使用 log(|S|) 而不是 log1p(|S|)
-        # 对于很小的幅度，log1p(x) ≈ x，会导致 Z-score 后仍然很小
-        # 使用 log(max(|S|, eps)) 可以将小值映射到负数，增大动态范围
-        log_magnitude = np.log(np.maximum(magnitude, self.eps))
-        
-        if debug:
-            print(f"[DEBUG] Log幅度 - mean: {np.mean(log_magnitude):.6f}, std: {np.std(log_magnitude):.6f}")
-            print(f"[DEBUG] 使用文件级归一化参数 - mean: {file_mean:.6f}, std: {file_std:.6f}")
-        
-        # 4. 使用文件级统计量进行 Z-score 归一化
-        norm_log_mag = (log_magnitude - file_mean) / file_std  # [F, T]
-        
-        if debug:
-            print(f"[DEBUG] Z-score后 - mean: {np.mean(norm_log_mag):.6f}, std: {np.std(norm_log_mag):.6f}")
-        
-        # 5. 限制范围防止极端值
-        norm_log_mag = np.clip(norm_log_mag, -10.0, 10.0)
-        
-        # 6. 重建归一化数据: 归一化幅度 * 单位相位
-        normalized_data = np.zeros_like(data)
-        normalized_data[0] = norm_log_mag * phase[0]  # Real
-        normalized_data[1] = norm_log_mag * phase[1]  # Imag
-        
-        if debug:
-            final_mag = np.sqrt(normalized_data[0]**2 + normalized_data[1]**2 + self.eps)
-            print(f"[DEBUG] 最终数据幅度 - mean: {np.mean(final_mag):.6f}, std: {np.std(final_mag):.6f}")
-        
-        # 7. 检查并处理NaN/Inf
+        # 处理 NaN/Inf
         if not np.isfinite(normalized_data).all():
             normalized_data = np.nan_to_num(normalized_data, nan=0.0, posinf=0.0, neginf=0.0)
-        if not np.isfinite(phase).all():
-            phase = np.nan_to_num(phase, nan=0.0, posinf=0.0, neginf=0.0)
         
-        return normalized_data, phase
+        return normalized_data, mean, std
     
     def __len__(self) -> int:
         """返回数据集切片总数"""
@@ -341,60 +246,52 @@ class STFTSlicingDataset(Dataset):
         """
         获取指定索引的数据切片
         
+        使用 Instance Normalization：每个切片独立计算 mean/std，
+        直接对 Real/Imag 进行线性缩放，不做 Log 变换。
+        
         Args:
             idx: 切片索引
             
         Returns:
             包含以下键的字典:
                 - 'input': 归一化后的原始数据 [2, 103, 156]
-                - 'target': 归一化后的噪声残差 [2, 103, 156]
-                - 'mean': 原始数据的文件级归一化均值
-                - 'std': 原始数据的文件级归一化标准差
-                - 'clean_norm': 归一化后的干净数据 [2, 103, 156]
+                - 'target': 归一化后的干净数据 [2, 103, 156] (直接预测clean，非残差)
+                - 'mean': raw切片的归一化均值 (用于反归一化)
+                - 'std': raw切片的归一化标准差 (用于反归一化)
+                - 'raw_slice': 原始未归一化的raw数据 [2, 103, 156] (用于Loss计算)
+                - 'clean_slice': 原始未归一化的clean数据 [2, 103, 156] (用于Loss计算)
         """
         raw_file, clean_file, start_idx = self.slice_indices[idx]
         
-        # 加载切片
+        # 加载切片 (已完成频域裁剪和数据清洗)
         raw_slice, clean_slice = self._load_slice(raw_file, clean_file, start_idx)
         
-        # 获取文件级归一化参数（基于raw文件计算）
-        file_mean, file_std = self.file_norm_params[raw_file]
+        # Instance Normalization: 使用 raw 切片的统计量
+        raw_norm, raw_mean, raw_std = self._instance_normalize(raw_slice)
         
-        # 使用文件级统计量对 raw 进行幅度-相位分离归一化
-        raw_norm, raw_phase = self._normalize_amplitude_phase(raw_slice, file_mean, file_std)
+        # 对 clean 使用相同的统计量进行归一化 (保持一致性)
+        clean_norm = (clean_slice - raw_mean) / raw_std
+        clean_norm = np.clip(clean_norm, -10.0, 10.0)
+        if not np.isfinite(clean_norm).all():
+            clean_norm = np.nan_to_num(clean_norm, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # 使用相同的文件级统计量对 clean 进行归一化（确保raw和clean使用相同策略）
-        clean_norm, clean_phase = self._normalize_amplitude_phase(clean_slice, file_mean, file_std)
+        # 转换为 PyTorch 张量
+        input_tensor = torch.from_numpy(raw_norm.copy()).float()
+        target_tensor = torch.from_numpy(clean_norm.copy()).float()
+        raw_tensor = torch.from_numpy(raw_slice.copy()).float()
+        clean_tensor = torch.from_numpy(clean_slice.copy()).float()
         
-        # 计算残差目标: Noise = Raw - Clean (在归一化域)
-        noise_norm = raw_norm - clean_norm
-        
-        # 检查并处理NaN/Inf
-        if not np.isfinite(noise_norm).all():
-            noise_norm = np.nan_to_num(noise_norm, nan=0.0, posinf=0.0, neginf=0.0)
-        
-        # 转换为PyTorch张量
-        input_tensor = torch.from_numpy(raw_norm).float()
-        target_tensor = torch.from_numpy(noise_norm).float()
-        clean_tensor = torch.from_numpy(clean_norm).float()
-        
-        # 最终安全检查：限制输出值域防止梯度爆炸
-        max_output_val = 10.0  # 归一化后数据应该在合理范围内
-        input_tensor = torch.clamp(input_tensor, -max_output_val, max_output_val)
-        target_tensor = torch.clamp(target_tensor, -max_output_val, max_output_val)
-        clean_tensor = torch.clamp(clean_tensor, -max_output_val, max_output_val)
-        
-        # 替换任何残留的 NaN/Inf
+        # 安全检查
         input_tensor = torch.nan_to_num(input_tensor, nan=0.0, posinf=0.0, neginf=0.0)
         target_tensor = torch.nan_to_num(target_tensor, nan=0.0, posinf=0.0, neginf=0.0)
-        clean_tensor = torch.nan_to_num(clean_tensor, nan=0.0, posinf=0.0, neginf=0.0)
         
         return {
-            'input': input_tensor,      # [2, 103, 156]
-            'target': target_tensor,    # [2, 103, 156]
-            'mean': torch.tensor(file_mean).float(),   # 文件级归一化参数
-            'std': torch.tensor(file_std).float(),     # 文件级归一化参数
-            'clean_norm': clean_tensor  # [2, 103, 156]
+            'input': input_tensor,        # [2, 103, 156] 归一化后的 raw
+            'target': target_tensor,      # [2, 103, 156] 归一化后的 clean (直接预测目标)
+            'mean': torch.tensor(raw_mean).float(),
+            'std': torch.tensor(raw_std).float(),
+            'raw_slice': raw_tensor,      # [2, 103, 156] 原始 raw (用于 Loss)
+            'clean_slice': clean_tensor   # [2, 103, 156] 原始 clean (用于 Loss)
         }
 
 
