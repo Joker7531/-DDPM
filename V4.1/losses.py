@@ -81,13 +81,16 @@ class DifferentiableISTFTLoss(nn.Module):
         Returns:
             重建的时域信号 [B, L]
         """
+        # 确保窗函数和输入在同一设备上
+        window = self.window.to(stft_complex.device)
+        
         # PyTorch 的 istft 函数是可微分的
         signal = torch.istft(
             stft_complex,
             n_fft=self.n_fft,
             hop_length=self.hop_length,
             win_length=self.win_length,
-            window=self.window,
+            window=window,
             center=True,
             normalized=False,
             onesided=True,
