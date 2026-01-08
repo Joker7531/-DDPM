@@ -42,15 +42,15 @@ def get_default_config():
         # 损失配置
         # ==================
         "charbonnier_eps": 1e-6,          # Charbonnier loss epsilon
-        "use_weighted_recon": False,      # 是否使用置信图加权重建损失
+        "use_weighted_recon": True,       # 使用置信图加权重建损失（让 w 参与任务闭环）
         
         # 置信图正则
         "tv_weight": 0.01,                # TV 平滑正则权重
-        "var_weight": 1.0,                # 方差惩罚权重（鼓励 w 有变化，防止塌缩）
+        "boundary_weight": 0.1,           # 边界惩罚权重（降低以平衡主任务）
         
         # 损失权重
         "recon_weight": 1.0,              # 重建损失权重
-        "conf_reg_weight": 1.0,           # 置信图正则权重（增大到1.0以防止w退化）
+        "conf_reg_weight": 0.1,           # 置信图正则权重（降低让重建主导）
         "consistency_weight": 0.0,        # 一致性损失权重（默认不使用）
         "consistency_type": "l1",         # 一致性损失类型
         

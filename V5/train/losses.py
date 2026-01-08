@@ -81,12 +81,12 @@ class ConfidenceRegularization(nn.Module):
     置信图 w 的正则化
     包含:
         - TV (Total Variation) 平滑正则
-        - 方差惩罚（鼓励 w 有变化，防止塌缩为常数）
+        - 边界惩罚（惩罚 w 太接近 0 或 1，鼓励在中间范围）
     """
-    def __init__(self, tv_weight: float = 0.01, var_weight: float = 0.1):
+    def __init__(self, tv_weight: float = 0.01, boundary_weight: float = 0.1):
         super().__init__()
         self.tv_weight = tv_weight
-        self.var_weight = var_weight  # 方差惩罚权重
+        self.boundary_weight = boundary_weight  # 边界惩罚权重
     
     def tv_loss(self, w: torch.Tensor) -> torch.Tensor:
         """
@@ -97,21 +97,21 @@ class ConfidenceRegularization(nn.Module):
         diff = w[:, :, 1:] - w[:, :, :-1]
         return torch.abs(diff).mean()
     
-    def variance_penalty(self, w: torch.Tensor) -> torch.Tensor:
+    def boundary_penalty(self, w: torch.Tensor) -> torch.Tensor:
         """
-        方差惩罚：惩罚方差过小，鼓励 w 有变化
-        当 w 全为常数时，方差为 0，损失最大
+        边界惩罚：惩罚 w 太接近 0 或 1
+        使用负对数似然鼓励 w 在 (0, 1) 内部
         Args:
-            w: (B, 1, L)
+            w: (B, 1, L)  范围应该在 [0, 1]
         Returns:
-            loss: 负的对数方差（方差越小损失越大）
+            loss: -log(w) - log(1-w) 的均值（在边界处趋于无穷）
         """
-        # 计算每个样本的方差
-        var = w.var(dim=-1, keepdim=True)  # (B, 1, 1)
-        # 惩罚方差过小：方差越小，损失越大
-        # 使用 -log(var + eps) 来惩罚小方差
         eps = 1e-6
-        return -torch.log(var + eps).mean()
+        w_clamp = torch.clamp(w, eps, 1 - eps)
+        # 同时惩罚接近0和接近1：-log(w) - log(1-w)
+        # 这在 w=0.5 时最小，在 w→0 或 w→1 时趋于无穷
+        boundary_loss = -torch.log(w_clamp) - torch.log(1 - w_clamp)
+        return boundary_loss.mean()
     
     def forward(self, w: torch.Tensor) -> tuple:
         """
@@ -121,13 +121,13 @@ class ConfidenceRegularization(nn.Module):
         Returns:
             total_reg: scalar
             tv: scalar (单独返回tv值)
-            var_pen: scalar (单独返回方差惩罚值)
+            boundary_pen: scalar (单独返回边界惩罚值)
         """
         tv = self.tv_loss(w)
-        var_pen = self.variance_penalty(w)
+        boundary_pen = self.boundary_penalty(w)
         
-        total_reg = self.tv_weight * tv + self.var_weight * var_pen
-        return total_reg, tv, var_pen
+        total_reg = self.tv_weight * tv + self.boundary_weight * boundary_pen
+        return total_reg, tv, boundary_pen
 
 
 # ================================
@@ -206,9 +206,10 @@ def compute_losses(
     recon_criterion = CharbonnierLoss(eps=cfg.get("charbonnier_eps", 1e-6))
     
     if cfg.get("use_weighted_recon", False):
-        # 使用置信图加权（w 越小越不强迫拟合）
-        # 可以使用 (1-w) 作为权重，或直接 w（取决于语义）
-        # 这里假设 w 表示"置信度"，越高越可信，因此直接用 w 加权
+        # 使用置信图加权
+        # w 的语义：接近 0.5 表示"不确定"，接近边界（0或1）表示"确定"
+        # 这里我们直接用 w 作为权重：w 大 → 更重视该位置的重建
+        # 边界惩罚会自然地让 w 在 (0,1) 内分布，模型学习哪些位置需要更多关注
         recon_loss = recon_criterion(y_hat, x_clean, weight=w)
     else:
         recon_loss = recon_criterion(y_hat, x_clean, weight=None)
@@ -216,9 +217,9 @@ def compute_losses(
     # 2) 置信图正则
     conf_reg_criterion = ConfidenceRegularization(
         tv_weight=cfg.get("tv_weight", 0.01),
-        var_weight=cfg.get("var_weight", 0.1),
+        boundary_weight=cfg.get("boundary_weight", 0.1),
     )
-    conf_reg_loss, tv_loss, var_penalty = conf_reg_criterion(w)
+    conf_reg_loss, tv_loss, boundary_penalty = conf_reg_criterion(w)
     
     # 3) 一致性损失（可选）
     consistency_loss = torch.tensor(0.0, device=y_hat.device)
@@ -239,7 +240,7 @@ def compute_losses(
         "recon": recon_loss,
         "conf_reg": conf_reg_loss,
         "tv": tv_loss,
-        "var_penalty": var_penalty,
+        "boundary_penalty": boundary_penalty,
         "consistency": consistency_loss,
     }
     
