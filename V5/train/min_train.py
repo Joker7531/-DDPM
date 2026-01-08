@@ -8,7 +8,8 @@ from torch.utils.data import DataLoader
 from typing import Dict, Optional
 import time
 from pathlib import Path
-import numpy as npfrom tqdm import tqdm
+import numpy as np
+from tqdm import tqdm
 from .losses import compute_losses
 
 
