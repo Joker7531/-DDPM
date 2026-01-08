@@ -37,13 +37,13 @@ def build_dataloaders(
         {"train": train_loader, "val": val_loader, "test": test_loader}
     """
     
-    # Train dataset: 随机裁剪
+    # Train dataset: 使用滑窗切片（如果提供了stride）或随机裁剪
     train_ds = EEGPairDataset(
         root=root,
         split="train",
         segment_length=segment_length,
-        random_crop=True,
-        stride=train_stride,
+        random_crop=(train_stride is None),  # 仅在未提供stride时随机裁剪
+        stride=train_stride if train_stride else segment_length,
         normalize=normalize,
         return_meta=return_meta,
     )
