@@ -56,11 +56,18 @@ def train_one_epoch(
     total_conf_reg = 0.0
     total_consistency = 0.0
     
+    # 用于详细统计
+    w_means = []
+    w_stds = []
+    
     num_batches = 0
     
     # 创建进度条
     total_iters = min(len(train_loader), max_batches) if max_batches else len(train_loader)
     pbar = tqdm(enumerate(train_loader), total=total_iters, desc=f"Epoch {epoch}", ncols=120)
+    
+    # 是否打印详细信息（每10个epoch或第一个epoch）
+    verbose = (epoch == 1 or epoch % 10 == 0)
     
     for batch_idx, batch in pbar:
         if max_batches is not None and batch_idx >= max_batches:
@@ -105,6 +112,11 @@ def train_one_epoch(
         total_consistency += losses["consistency"].item()
         num_batches += 1
         
+        # 收集w统计
+        if "w" in outputs:
+            w_means.append(outputs["w"].mean().item())
+            w_stds.append(outputs["w"].std().item())
+        
         # 更新进度条
         pbar.set_postfix({
             'loss': f'{loss.item():.4f}',
@@ -118,6 +130,8 @@ def train_one_epoch(
         "recon": total_recon / num_batches,
         "conf_reg": total_conf_reg / num_batches,
         "consistency": total_consistency / num_batches,
+        "w_mean": np.mean(w_means) if w_means else 0.0,
+        "w_std": np.mean(w_stds) if w_stds else 0.0,
     }
     
     return metrics
@@ -149,6 +163,9 @@ def validate(
     total_loss = 0.0
     total_recon = 0.0
     total_conf_reg = 0.0
+    
+    w_means = []
+    w_stds = []
     
     num_batches = 0
     
@@ -186,6 +203,11 @@ def validate(
         total_conf_reg += losses["conf_reg"].item()
         num_batches += 1
         
+        # 收集w统计
+        if "w" in outputs:
+            w_means.append(outputs["w"].mean().item())
+            w_stds.append(outputs["w"].std().item())
+        
         # 更新进度条
         pbar.set_postfix({
             'loss': f'{losses["total"].item():.4f}',
@@ -197,6 +219,8 @@ def validate(
         "loss": total_loss / num_batches,
         "recon": total_recon / num_batches,
         "conf_reg": total_conf_reg / num_batches,
+        "w_mean": np.mean(w_means) if w_means else 0.0,
+        "w_std": np.mean(w_stds) if w_stds else 0.0,
     }
     
     return metrics
@@ -227,9 +251,12 @@ def train(
     """
     num_epochs = cfg.get("num_epochs", 10)
     best_val_loss = float("inf")
+    patience = cfg.get("early_stop_patience", 20)  # Early stopping 耐心值
+    no_improve_count = 0
     
     print(f"\n{'='*60}")
     print(f"Starting training for {num_epochs} epochs")
+    print(f"Early stopping patience: {patience} epochs")
     print(f"{'='*60}\n")
     
     for epoch in range(1, num_epochs + 1):
@@ -255,24 +282,47 @@ def train(
         epoch_time = time.time() - epoch_start
         
         lr_str = f" | LR: {scheduler.get_last_lr()[0]:.2e}" if scheduler is not None else ""
-        print(f"\n{'='*120}")
-        print(f"Epoch {epoch}/{num_epochs} ({epoch_time:.1f}s) - "
-              f"Train: {train_metrics['loss']:.4f} ({train_metrics['recon']:.4f}) | "
-              f"Val: {val_metrics['loss']:.4f} ({val_metrics['recon']:.4f}){lr_str}")
-        print(f"{'='*120}")
         
-        # 保存最佳模型
-        if save_dir is not None and val_metrics['loss'] < best_val_loss:
-            best_val_loss = val_metrics['loss']
-            save_path = save_dir / "best_model.pth"
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': val_metrics['loss'],
-                'cfg': cfg,
-            }, save_path)
-            print(f"  ✓ Saved best model to {save_path}")
+        # 每10个epoch或第一个epoch打印详细信息
+        if epoch == 1 or epoch % 10 == 0:
+            print(f"\n{'='*120}")
+            print(f"Epoch {epoch}/{num_epochs} ({epoch_time:.1f}s)")
+            print(f"  Train: Loss={train_metrics['loss']:.4f}, Recon={train_metrics['recon']:.4f}, "
+                  f"ConfReg={train_metrics['conf_reg']:.6f}, w_mean={train_metrics['w_mean']:.3f}, w_std={train_metrics['w_std']:.3f}")
+            print(f"  Val:   Loss={val_metrics['loss']:.4f}, Recon={val_metrics['recon']:.4f}, "
+                  f"ConfReg={val_metrics['conf_reg']:.6f}{lr_str}")
+            print(f"{'='*120}")
+        else:
+            # 简洁显示
+            print(f"\n{'='*120}")
+            print(f"Epoch {epoch}/{num_epochs} ({epoch_time:.1f}s) - "
+                  f"Train: {train_metrics['loss']:.4f} ({train_metrics['recon']:.4f}) | "
+                  f"Val: {val_metrics['loss']:.4f} ({val_metrics['recon']:.4f}){lr_str}")
+            print(f"{'='*120}")
+        
+        # 保存最佳模型和 Early Stopping
+        if save_dir is not None:
+            if val_metrics['loss'] < best_val_loss:
+                best_val_loss = val_metrics['loss']
+                no_improve_count = 0
+                save_path = save_dir / "best_model.pth"
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'val_loss': val_metrics['loss'],
+                    'cfg': cfg,
+                }, save_path)
+                print(f"  ✓ Saved best model to {save_path} (val_loss improved)")
+            else:
+                no_improve_count += 1
+                print(f"  No improvement for {no_improve_count}/{patience} epochs")
+                
+                # Early stopping
+                if no_improve_count >= patience:
+                    print(f"\n⚠ Early stopping triggered after {epoch} epochs")
+                    print(f"  Best validation loss: {best_val_loss:.6f}")
+                    break
     
     print(f"\n{'='*60}")
     print(f"Training completed!")

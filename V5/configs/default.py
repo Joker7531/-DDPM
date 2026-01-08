@@ -50,7 +50,7 @@ def get_default_config():
         
         # 损失权重
         "recon_weight": 1.0,              # 重建损失权重
-        "conf_reg_weight": 0.1,           # 置信图正则权重
+        "conf_reg_weight": 1.0,           # 置信图正则权重（增大到1.0以防止w退化）
         "consistency_weight": 0.0,        # 一致性损失权重（默认不使用）
         "consistency_type": "l1",         # 一致性损失类型
         
@@ -59,8 +59,9 @@ def get_default_config():
         # ==================
         "num_epochs": 50,                 # 训练 epoch 数
         "learning_rate": 1e-4,            # 初始学习率
-        "weight_decay": 1e-5,             # 权重衰减
+        "weight_decay": 1e-4,             # 权重衰减（增大到1e-4以增强正则化）
         "grad_clip": 1.0,                 # 梯度裁剪（0 表示不裁剪）
+        "early_stop_patience": 20,        # Early stopping 耐心值（验证损失不降低的最大 epoch 数）
         
         # 学习率调度器
         "use_scheduler": True,            # 是否使用学习率调度器
