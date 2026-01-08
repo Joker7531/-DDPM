@@ -23,7 +23,7 @@ def parse_args():
     default_dataset = str(Path(__file__).parent.parent / "Dataset")
     parser.add_argument("--dataset_root", type=str, default=default_dataset,
                         help="数据集根目录")
-    parser.add_argument("--batch_size", type=int, default=32,
+    parser.add_argument("--batch_size", type=int, default=16,
                         help="Batch size")
     parser.add_argument("--segment_length", type=int, default=2048,
                         help="输入信号长度")

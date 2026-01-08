@@ -8,8 +8,7 @@ from torch.utils.data import DataLoader
 from typing import Dict, Optional
 import time
 from pathlib import Path
-import numpy as np
-
+import numpy as npfrom tqdm import tqdm
 from .losses import compute_losses
 
 
@@ -58,7 +57,11 @@ def train_one_epoch(
     
     num_batches = 0
     
-    for batch_idx, batch in enumerate(train_loader):
+    # 创建进度条
+    total_iters = min(len(train_loader), max_batches) if max_batches else len(train_loader)
+    pbar = tqdm(enumerate(train_loader), total=total_iters, desc=f"Epoch {epoch}", ncols=120)
+    
+    for batch_idx, batch in pbar:
         if max_batches is not None and batch_idx >= max_batches:
             break
         
@@ -101,12 +104,12 @@ def train_one_epoch(
         total_consistency += losses["consistency"].item()
         num_batches += 1
         
-        # 打印进度
-        if batch_idx % cfg.get("log_interval", 10) == 0:
-            print(f"  Epoch {epoch} [{batch_idx}/{len(train_loader)}] "
-                  f"Loss: {loss.item():.4f} | "
-                  f"Recon: {losses['recon'].item():.4f} | "
-                  f"ConfReg: {losses['conf_reg'].item():.4f}")
+        # 更新进度条
+        pbar.set_postfix({
+            'loss': f'{loss.item():.4f}',
+            'recon': f'{losses["recon"].item():.4f}',
+            'conf': f'{losses["conf_reg"].item():.4f}'
+        })
     
     # 平均指标
     metrics = {
@@ -148,7 +151,11 @@ def validate(
     
     num_batches = 0
     
-    for batch_idx, batch in enumerate(val_loader):
+    # 创建进度条
+    total_iters = min(len(val_loader), max_batches) if max_batches else len(val_loader)
+    pbar = tqdm(enumerate(val_loader), total=total_iters, desc="Validation", ncols=120, leave=False)
+    
+    for batch_idx, batch in pbar:
         if max_batches is not None and batch_idx >= max_batches:
             break
         
@@ -177,6 +184,12 @@ def validate(
         total_recon += losses["recon"].item()
         total_conf_reg += losses["conf_reg"].item()
         num_batches += 1
+        
+        # 更新进度条
+        pbar.set_postfix({
+            'loss': f'{losses["total"].item():.4f}',
+            'recon': f'{losses["recon"].item():.4f}'
+        })
     
     # 平均指标
     metrics = {
@@ -222,14 +235,12 @@ def train(
         epoch_start = time.time()
         
         # 训练
-        print(f"\n[Epoch {epoch}/{num_epochs}] Training...")
         train_metrics = train_one_epoch(
             model, train_loader, optimizer, cfg, device, epoch,
             max_batches=cfg.get("max_train_batches", None),
         )
         
         # 验证
-        print(f"\n[Epoch {epoch}/{num_epochs}] Validating...")
         val_metrics = validate(
             model, val_loader, cfg, device,
             max_batches=cfg.get("max_val_batches", None),
@@ -241,13 +252,13 @@ def train(
         
         # 打印统计
         epoch_time = time.time() - epoch_start
-        print(f"\n[Epoch {epoch}/{num_epochs}] Summary:")
-        print(f"  Time: {epoch_time:.2f}s")
-        print(f"  Train Loss: {train_metrics['loss']:.6f} | Recon: {train_metrics['recon']:.6f}")
-        print(f"  Val   Loss: {val_metrics['loss']:.6f} | Recon: {val_metrics['recon']:.6f}")
         
-        if scheduler is not None:
-            print(f"  LR: {scheduler.get_last_lr()[0]:.6f}")
+        lr_str = f" | LR: {scheduler.get_last_lr()[0]:.2e}" if scheduler is not None else ""
+        print(f"\n{'='*120}")
+        print(f"Epoch {epoch}/{num_epochs} ({epoch_time:.1f}s) - "
+              f"Train: {train_metrics['loss']:.4f} ({train_metrics['recon']:.4f}) | "
+              f"Val: {val_metrics['loss']:.4f} ({val_metrics['recon']:.4f}){lr_str}")
+        print(f"{'='*120}")
         
         # 保存最佳模型
         if save_dir is not None and val_metrics['loss'] < best_val_loss:
