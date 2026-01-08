@@ -46,7 +46,7 @@ def get_default_config():
         
         # 置信图正则
         "tv_weight": 0.01,                # TV 平滑正则权重
-        "entropy_weight": 0.01,           # 熵正则权重
+        "var_weight": 1.0,                # 方差惩罚权重（鼓励 w 有变化，防止塌缩）
         
         # 损失权重
         "recon_weight": 1.0,              # 重建损失权重

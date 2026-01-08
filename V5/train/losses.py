@@ -212,9 +212,9 @@ def compute_losses(
     # 2) 置信图正则
     conf_reg_criterion = ConfidenceRegularization(
         tv_weight=cfg.get("tv_weight", 0.01),
-        entropy_weight=cfg.get("entropy_weight", 0.01),
+        var_weight=cfg.get("var_weight", 0.1),
     )
-    conf_reg_loss, tv_loss, entropy_loss = conf_reg_criterion(w)
+    conf_reg_loss, tv_loss, var_penalty = conf_reg_criterion(w)
     
     # 3) 一致性损失（可选）
     consistency_loss = torch.tensor(0.0, device=y_hat.device)
@@ -235,7 +235,7 @@ def compute_losses(
         "recon": recon_loss,
         "conf_reg": conf_reg_loss,
         "tv": tv_loss,
-        "entropy": entropy_loss,
+        "var_penalty": var_penalty,
         "consistency": consistency_loss,
     }
     

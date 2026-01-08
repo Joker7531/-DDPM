@@ -55,7 +55,7 @@ def train_one_epoch(
     total_recon = 0.0
     total_conf_reg = 0.0
     total_tv = 0.0
-    total_entropy = 0.0
+    total_var_penalty = 0.0
     total_consistency = 0.0
     
     # 用于详细统计
@@ -108,20 +108,20 @@ def train_one_epoch(
         # 梯度诊断（verbose 模式且第一个 batch）
         if verbose and batch_idx == 0:
             print("\n  === Gradient Diagnostics ===")
-            # 检查 w_head 参数
+            # 检查 confidence_head 参数
             for name, param in model.named_parameters():
-                if 'w_head' in name:
+                if 'confidence_head' in name:
                     if param.grad is not None:
                         grad_norm = param.grad.norm().item()
                         print(f"    {name}: requires_grad={param.requires_grad}, grad_norm={grad_norm:.6f}")
                     else:
                         print(f"    {name}: requires_grad={param.requires_grad}, grad=None")
             
-            # 检查 w 的梯度
-            if 'w' in outputs and outputs['w'].grad is not None:
-                print(f"    w: grad_norm={outputs['w'].grad.norm().item():.6f}")
-            elif 'w' in outputs:
-                print(f"    w: grad=None (leaf={outputs['w'].is_leaf})")
+            # 检查 w 的统计
+            if 'w' in outputs:
+                w_data = outputs['w']
+                print(f"    w: mean={w_data.mean().item():.4f}, std={w_data.std().item():.4f}, "
+                      f"min={w_data.min().item():.4f}, max={w_data.max().item():.4f}")
         
         optimizer.step()
         
@@ -130,7 +130,7 @@ def train_one_epoch(
         total_recon += losses["recon"].item()
         total_conf_reg += losses["conf_reg"].item()
         total_tv += losses["tv"].item()
-        total_entropy += losses["entropy"].item()
+        total_var_penalty += losses["var_penalty"].item()
         total_consistency += losses["consistency"].item()
         num_batches += 1
         
@@ -144,7 +144,7 @@ def train_one_epoch(
             'loss': f'{loss.item():.4f}',
             'recon': f'{losses["recon"].item():.4f}',
             'tv': f'{losses["tv"].item():.4f}',
-            'ent': f'{losses["entropy"].item():.4f}'
+            'var': f'{losses["var_penalty"].item():.4f}'
         })
     
     # 平均指标
@@ -153,7 +153,7 @@ def train_one_epoch(
         "recon": total_recon / num_batches,
         "conf_reg": total_conf_reg / num_batches,
         "tv": total_tv / num_batches,
-        "entropy": total_entropy / num_batches,
+        "var_penalty": total_var_penalty / num_batches,
         "consistency": total_consistency / num_batches,
         "w_mean": np.mean(w_means) if w_means else 0.0,
         "w_std": np.mean(w_stds) if w_stds else 0.0,
@@ -189,7 +189,7 @@ def validate(
     total_recon = 0.0
     total_conf_reg = 0.0
     total_tv = 0.0
-    total_entropy = 0.0
+    total_var_penalty = 0.0
     
     w_means = []
     w_stds = []
@@ -229,7 +229,7 @@ def validate(
         total_recon += losses["recon"].item()
         total_conf_reg += losses["conf_reg"].item()
         total_tv += losses["tv"].item()
-        total_entropy += losses["entropy"].item()
+        total_var_penalty += losses["var_penalty"].item()
         num_batches += 1
         
         # 收集w统计
@@ -249,7 +249,7 @@ def validate(
         "recon": total_recon / num_batches,
         "conf_reg": total_conf_reg / num_batches,
         "tv": total_tv / num_batches,
-        "entropy": total_entropy / num_batches,
+        "var_penalty": total_var_penalty / num_batches,
         "w_mean": np.mean(w_means) if w_means else 0.0,
         "w_std": np.mean(w_stds) if w_stds else 0.0,
     }
@@ -319,10 +319,10 @@ def train(
             print(f"\n{'='*120}")
             print(f"Epoch {epoch}/{num_epochs} ({epoch_time:.1f}s)")
             print(f"  Train: Loss={train_metrics['loss']:.4f}, Recon={train_metrics['recon']:.4f}, "
-                  f"ConfReg={train_metrics['conf_reg']:.6f} (TV={train_metrics['tv']:.6f}, Ent={train_metrics['entropy']:.6f})")
+                  f"ConfReg={train_metrics['conf_reg']:.6f} (TV={train_metrics['tv']:.6f}, VarPen={train_metrics['var_penalty']:.4f})")
             print(f"         w_mean={train_metrics['w_mean']:.3f}, w_std={train_metrics['w_std']:.4f}")
             print(f"  Val:   Loss={val_metrics['loss']:.4f}, Recon={val_metrics['recon']:.4f}, "
-                  f"ConfReg={val_metrics['conf_reg']:.6f} (TV={val_metrics['tv']:.6f}, Ent={val_metrics['entropy']:.6f}){lr_str}")
+                  f"ConfReg={val_metrics['conf_reg']:.6f} (TV={val_metrics['tv']:.6f}, VarPen={val_metrics['var_penalty']:.4f}){lr_str}")
             print(f"         w_mean={val_metrics['w_mean']:.3f}, w_std={val_metrics['w_std']:.4f}")
             print(f"{'='*120}")
         else:
