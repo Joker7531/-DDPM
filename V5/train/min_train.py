@@ -356,4 +356,4 @@ def main_minimal_example():
 
 
 if __name__ == "__main__":
-    main_minimal_example()
+    train()
