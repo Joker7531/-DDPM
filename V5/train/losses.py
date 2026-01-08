@@ -212,7 +212,7 @@ def compute_losses(
         tv_weight=cfg.get("tv_weight", 0.01),
         entropy_weight=cfg.get("entropy_weight", 0.01),
     )
-    conf_reg_loss = conf_reg_criterion(w)
+    conf_reg_loss, tv_loss, entropy_loss = conf_reg_criterion(w)
     
     # 3) 一致性损失（可选）
     consistency_loss = torch.tensor(0.0, device=y_hat.device)
@@ -232,6 +232,8 @@ def compute_losses(
         "total": total_loss,
         "recon": recon_loss,
         "conf_reg": conf_reg_loss,
+        "tv": tv_loss,
+        "entropy": entropy_loss,
         "consistency": consistency_loss,
     }
     
