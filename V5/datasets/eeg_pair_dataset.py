@@ -64,31 +64,53 @@ class EEGPairDataset(Dataset):
         raw_files = sorted([f.name for f in self.raw_dir.glob("*.npy")])
         clean_files = sorted([f.name for f in self.clean_dir.glob("*.npy")])
         
-        # 检查配对一致性
-        raw_set = set(raw_files)
-        clean_set = set(clean_files)
-        common = raw_set & clean_set
+        # 提取基础名称（去除 _raw 或 _clean 后缀）
+        def get_base_name(filename: str) -> str:
+            """从文件名中提取基础ID
+            支持格式：
+            - train_001_raw.npy -> train_001
+            - sub01_raw.npy -> sub01
+            - 001.npy -> 001
+            """
+            name = filename.replace(".npy", "")
+            # 移除常见后缀
+            for suffix in ["_raw", "_clean", "_noisy", "_denoised"]:
+                if name.endswith(suffix):
+                    return name[:-len(suffix)]
+            return name
         
-        if len(common) == 0:
+        # 建立基础名到文件名的映射
+        raw_map = {get_base_name(f): f for f in raw_files}
+        clean_map = {get_base_name(f): f for f in clean_files}
+        
+        # 找到共同的基础名
+        common_bases = set(raw_map.keys()) & set(clean_map.keys())
+        
+        if len(common_bases) == 0:
             error_msg = f"No matching pairs found in {self.split}\n"
             error_msg += f"  Raw dir: {self.raw_dir} ({len(raw_files)} files)\n"
             error_msg += f"  Clean dir: {self.clean_dir} ({len(clean_files)} files)\n"
             error_msg += f"  Please check:\n"
             error_msg += f"    1. Dataset root path is correct\n"
             error_msg += f"    2. Files exist in both raw/ and clean/ directories\n"
-            error_msg += f"    3. File names match between raw/ and clean/\n"
+            error_msg += f"    3. File names match between raw/ and clean/ (after removing _raw/_clean suffixes)\n"
             if len(raw_files) > 0:
                 error_msg += f"  Example raw files: {raw_files[:3]}\n"
             if len(clean_files) > 0:
                 error_msg += f"  Example clean files: {clean_files[:3]}\n"
+            if len(raw_files) > 0 and len(clean_files) > 0:
+                error_msg += f"  Example base names:\n"
+                error_msg += f"    Raw: {[get_base_name(f) for f in raw_files[:3]]}\n"
+                error_msg += f"    Clean: {[get_base_name(f) for f in clean_files[:3]]}\n"
             raise AssertionError(error_msg)
         
-        if len(common) < len(raw_set):
-            print(f"Warning: {len(raw_set) - len(common)} raw files missing clean counterpart")
-        if len(common) < len(clean_set):
-            print(f"Warning: {len(clean_set) - len(common)} clean files missing raw counterpart")
+        if len(common_bases) < len(raw_map):
+            print(f"Warning: {len(raw_map) - len(common_bases)} raw files missing clean counterpart")
+        if len(common_bases) < len(clean_map):
+            print(f"Warning: {len(clean_map) - len(common_bases)} clean files missing raw counterpart")
         
-        pairs = sorted(list(common))
+        # 返回配对：[(raw_filename, clean_filename), ...]
+        pairs = [(raw_map[base], clean_map[base]) for base in sorted(common_bases)]
         print(f"[{self.split}] Found {len(pairs)} valid pairs")
         return pairs
     
@@ -98,8 +120,8 @@ class EEGPairDataset(Dataset):
         返回: [(file_idx, start_idx), ...]
         """
         slices = []
-        for file_idx, fname in enumerate(self.file_pairs):
-            raw_path = self.raw_dir / fname
+        for file_idx, (raw_fname, clean_fname) in enumerate(self.file_pairs):
+            raw_path = self.raw_dir / raw_fname
             arr = np.load(raw_path)
             L = arr.shape[-1] if arr.ndim == 2 else len(arr)
             
@@ -166,9 +188,9 @@ class EEGPairDataset(Dataset):
             file_idx = idx
             start = None  # 稍后根据策略确定
         
-        fname = self.file_pairs[file_idx]
-        raw_path = self.raw_dir / fname
-        clean_path = self.clean_dir / fname
+        raw_fname, clean_fname = self.file_pairs[file_idx]
+        raw_path = self.raw_dir / raw_fname
+        clean_path = self.clean_dir / clean_fname
         
         # 加载数据
         x_raw = self._load_and_unify(raw_path)    # (1, L)
@@ -219,7 +241,8 @@ class EEGPairDataset(Dataset):
         
         # 构建 meta
         meta = {
-            "filename": fname,
+            "raw_filename": raw_fname,
+            "clean_filename": clean_fname,
             "start": actual_start,
             "original_length": L,
             "is_padded": is_padded,
