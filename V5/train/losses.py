@@ -244,9 +244,11 @@ def compute_losses(
         "total": total_loss,
         "recon": recon_loss,
         "conf_reg": conf_reg_loss,
+        "conf_reg_weighted": conf_weight * conf_reg_loss,  # 实际贡献
         "tv": tv_loss,
         "boundary_penalty": boundary_penalty,
         "consistency": consistency_loss,
+        "conf_weight": conf_weight,  # 当前权重
     }
     
     return losses

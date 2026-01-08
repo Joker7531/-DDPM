@@ -601,6 +601,9 @@ class UAR_ACSSNet(nn.Module):
             nn.GELU(),
             nn.Conv2d(spec_channels // 2, 1, kernel_size=1),
         )
+        # Zero initialization for confidence_head last layer
+        nn.init.zeros_(self.confidence_head[-1].weight)
+        nn.init.zeros_(self.confidence_head[-1].bias)
     
     def forward(self, x_raw: torch.Tensor) -> Dict[str, torch.Tensor]:
         """

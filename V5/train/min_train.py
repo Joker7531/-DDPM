@@ -54,9 +54,11 @@ def train_one_epoch(
     total_loss = 0.0
     total_recon = 0.0
     total_conf_reg = 0.0
+    total_conf_reg_weighted = 0.0
     total_tv = 0.0
     total_boundary = 0.0
     total_consistency = 0.0
+    conf_weight_value = 0.0
     
     # 用于详细统计
     w_means = []
@@ -132,9 +134,11 @@ def train_one_epoch(
         total_loss += loss.item()
         total_recon += losses["recon"].item()
         total_conf_reg += losses["conf_reg"].item()
+        total_conf_reg_weighted += losses["conf_reg_weighted"].item()
         total_tv += losses["tv"].item()
         total_boundary += losses["boundary_penalty"].item()
         total_consistency += losses["consistency"].item()
+        conf_weight_value = losses["conf_weight"]
         num_batches += 1
         
         # 收集w统计
@@ -155,9 +159,11 @@ def train_one_epoch(
         "loss": total_loss / num_batches,
         "recon": total_recon / num_batches,
         "conf_reg": total_conf_reg / num_batches,
+        "conf_reg_weighted": total_conf_reg_weighted / num_batches,
         "tv": total_tv / num_batches,
         "boundary_penalty": total_boundary / num_batches,
         "consistency": total_consistency / num_batches,
+        "conf_weight": conf_weight_value,
         "w_mean": np.mean(w_means) if w_means else 0.0,
         "w_std": np.mean(w_stds) if w_stds else 0.0,
     }
@@ -231,8 +237,10 @@ def validate(
         total_loss += losses["total"].item()
         total_recon += losses["recon"].item()
         total_conf_reg += losses["conf_reg"].item()
+        total_conf_reg_weighted += losses["conf_reg_weighted"].item()
         total_tv += losses["tv"].item()
         total_boundary += losses["boundary_penalty"].item()
+        conf_weight_value = losses["conf_weight"]
         num_batches += 1
         
         # 收集w统计
@@ -251,8 +259,10 @@ def validate(
         "loss": total_loss / num_batches,
         "recon": total_recon / num_batches,
         "conf_reg": total_conf_reg / num_batches,
+        "conf_reg_weighted": total_conf_reg_weighted / num_batches,
         "tv": total_tv / num_batches,
         "boundary_penalty": total_boundary / num_batches,
+        "conf_weight": conf_weight_value,
         "w_mean": np.mean(w_means) if w_means else 0.0,
         "w_std": np.mean(w_stds) if w_stds else 0.0,
     }
@@ -319,14 +329,14 @@ def train(
         
         # 每10个epoch或第一个epoch打印详细信息
         if epoch == 1 or epoch % 10 == 0:
-            warmup_status = f" [Conf Warmup: {epoch}/{cfg.get('conf_warmup_epochs', 0)}]" if epoch <= cfg.get('conf_warmup_epochs', 0) else ""
+            warmup_status = f" [Conf Warmup: {epoch}/{cfg.get('conf_warmup_epochs', 0)}, Weight={train_metrics['conf_weight']:.2f}]" if epoch <= cfg.get('conf_warmup_epochs', 0) else ""
             print(f"\n{'='*120}")
             print(f"Epoch {epoch}/{num_epochs} ({epoch_time:.1f}s){warmup_status}")
             print(f"  Train: Loss={train_metrics['loss']:.4f}, Recon={train_metrics['recon']:.4f}, "
-                  f"ConfReg={train_metrics['conf_reg']:.6f} (TV={train_metrics['tv']:.6f}, Boundary={train_metrics['boundary_penalty']:.4f})")
+                  f"ConfReg={train_metrics['conf_reg_weighted']:.6f} (raw={train_metrics['conf_reg']:.4f}, TV={train_metrics['tv']:.6f}, Boundary={train_metrics['boundary_penalty']:.4f})")
             print(f"         w_mean={train_metrics['w_mean']:.3f}, w_std={train_metrics['w_std']:.4f}")
             print(f"  Val:   Loss={val_metrics['loss']:.4f}, Recon={val_metrics['recon']:.4f}, "
-                  f"ConfReg={val_metrics['conf_reg']:.6f} (TV={val_metrics['tv']:.6f}, Boundary={val_metrics['boundary_penalty']:.4f}){lr_str}")
+                  f"ConfReg={val_metrics['conf_reg_weighted']:.6f} (raw={val_metrics['conf_reg']:.4f}, TV={val_metrics['tv']:.6f}, Boundary={val_metrics['boundary_penalty']:.4f}){lr_str}")
             print(f"         w_mean={val_metrics['w_mean']:.3f}, w_std={val_metrics['w_std']:.4f}")
             print(f"{'='*120}")
         else:
