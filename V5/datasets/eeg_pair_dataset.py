@@ -69,7 +69,19 @@ class EEGPairDataset(Dataset):
         clean_set = set(clean_files)
         common = raw_set & clean_set
         
-        assert len(common) > 0, f"No matching pairs found in {self.split}"
+        if len(common) == 0:
+            error_msg = f"No matching pairs found in {self.split}\n"
+            error_msg += f"  Raw dir: {self.raw_dir} ({len(raw_files)} files)\n"
+            error_msg += f"  Clean dir: {self.clean_dir} ({len(clean_files)} files)\n"
+            error_msg += f"  Please check:\n"
+            error_msg += f"    1. Dataset root path is correct\n"
+            error_msg += f"    2. Files exist in both raw/ and clean/ directories\n"
+            error_msg += f"    3. File names match between raw/ and clean/\n"
+            if len(raw_files) > 0:
+                error_msg += f"  Example raw files: {raw_files[:3]}\n"
+            if len(clean_files) > 0:
+                error_msg += f"  Example clean files: {clean_files[:3]}\n"
+            raise AssertionError(error_msg)
         
         if len(common) < len(raw_set):
             print(f"Warning: {len(raw_set) - len(common)} raw files missing clean counterpart")
