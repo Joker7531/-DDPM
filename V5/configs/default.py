@@ -19,7 +19,7 @@ def get_default_config():
         "pin_memory": True,               # 是否 pin memory
         
         # 数据增强（可选）
-        "train_stride": None,             # train 滑窗步长（None 表示随机裁剪）
+        "train_stride": 512,             # train 滑窗步长（None 表示随机裁剪）
         "val_stride": 1024,               # val 滑窗步长（建议 segment_length // 2）
         "test_stride": 1024,              # test 滑窗步长
         
@@ -33,7 +33,7 @@ def get_default_config():
         # 时频分支
         "spec_channels": 64,              # 谱图编码器输出通道数
         "acss_depth": 3,                  # ACSSBlock 堆叠层数
-        "num_freq_bins": 103,             # STFT 频率 bin 数量（1-100Hz @ fs=500, n_fft=512）
+        "num_freq_bins": 101,             # STFT 频率 bin 数量（1-100Hz @ fs=500, n_fft=512）
         
         # 其他
         "dropout": 0.1,                   # dropout 比例

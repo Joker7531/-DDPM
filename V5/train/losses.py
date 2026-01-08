@@ -106,7 +106,8 @@ class ConfidenceRegularization(nn.Module):
         w_clamp = torch.clamp(w, eps, 1 - eps)
         entropy = -(w_clamp * torch.log(w_clamp) + (1 - w_clamp) * torch.log(1 - w_clamp))
         # 最大化熵 = 最小化负熵 = 最小化 -entropy
-        return -entropy.mean()
+        max_entropy = torch.log(torch.tensor(2.0, device=w_clamp.device))
+        return (max_entropy - entropy).mean()
     
     def forward(self, w: torch.Tensor) -> torch.Tensor:
         """
