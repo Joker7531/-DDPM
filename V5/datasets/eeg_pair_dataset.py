@@ -231,9 +231,16 @@ class EEGPairDataset(Dataset):
                 seg_clean = x_clean[:, actual_start:actual_start + self.segment_length]
                 is_padded = False
         
-        # 归一化
-        seg_raw = self._normalize(seg_raw)
-        seg_clean = self._normalize(seg_clean)
+        # 归一化：使用 raw 的统计量同时归一化两者（保持加性噪声假设）
+        if self.normalize == "zscore_per_sample":
+            # 仅计算 raw 的统计量
+            mean_raw = seg_raw.mean()
+            std_raw = seg_raw.std()
+            if std_raw < 1e-8:
+                std_raw = 1.0
+            # 用相同的统计量归一化两者
+            seg_raw = (seg_raw - mean_raw) / std_raw
+            seg_clean = (seg_clean - mean_raw) / std_raw
         
         # 转 tensor
         x_raw_t = torch.from_numpy(seg_raw).float()

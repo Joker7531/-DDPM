@@ -87,6 +87,9 @@ def train_one_epoch(
         # 前向传播
         outputs = model(x_raw)
         
+        # 更新配置中的当前epoch（用于warm-up调度）
+        cfg["_current_epoch"] = epoch
+        
         # 计算损失
         losses = compute_losses(
             batch=(x_raw, x_clean),
@@ -316,8 +319,9 @@ def train(
         
         # 每10个epoch或第一个epoch打印详细信息
         if epoch == 1 or epoch % 10 == 0:
+            warmup_status = f" [Conf Warmup: {epoch}/{cfg.get('conf_warmup_epochs', 0)}]" if epoch <= cfg.get('conf_warmup_epochs', 0) else ""
             print(f"\n{'='*120}")
-            print(f"Epoch {epoch}/{num_epochs} ({epoch_time:.1f}s)")
+            print(f"Epoch {epoch}/{num_epochs} ({epoch_time:.1f}s){warmup_status}")
             print(f"  Train: Loss={train_metrics['loss']:.4f}, Recon={train_metrics['recon']:.4f}, "
                   f"ConfReg={train_metrics['conf_reg']:.6f} (TV={train_metrics['tv']:.6f}, Boundary={train_metrics['boundary_penalty']:.4f})")
             print(f"         w_mean={train_metrics['w_mean']:.3f}, w_std={train_metrics['w_std']:.4f}")

@@ -228,10 +228,15 @@ def compute_losses(
         y_hat_aug = outputs_aug["y_hat"]
         consistency_loss = consistency_criterion(y_hat, y_hat_aug)
     
+    # Warm-up调度：前N个epoch置信图正则权重为0
+    current_epoch = cfg.get("_current_epoch", 0)
+    warmup_epochs = cfg.get("conf_warmup_epochs", 0)
+    conf_weight = 0.0 if current_epoch < warmup_epochs else cfg.get("conf_reg_weight", 0.1)
+    
     # 总损失
     total_loss = (
         cfg.get("recon_weight", 1.0) * recon_loss +
-        cfg.get("conf_reg_weight", 0.1) * conf_reg_loss +
+        conf_weight * conf_reg_loss +
         cfg.get("consistency_weight", 0.0) * consistency_loss
     )
     

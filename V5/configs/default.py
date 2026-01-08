@@ -51,6 +51,7 @@ def get_default_config():
         # 损失权重
         "recon_weight": 1.0,              # 重建损失权重
         "conf_reg_weight": 0.1,           # 置信图正则权重（降低让重建主导）
+        "conf_warmup_epochs": 20,         # 置信度正则 warm-up epoch 数（前N个epoch conf_reg=0）
         "consistency_weight": 0.0,        # 一致性损失权重（默认不使用）
         "consistency_type": "l1",         # 一致性损失类型
         

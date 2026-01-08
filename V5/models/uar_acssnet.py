@@ -215,7 +215,8 @@ class ScanFreq(nn.Module):
         super().__init__()
         # 对每个 (t) 位置，沿 f 维度扫描
         # 实现：permute 到 (B,C,F,T) 后做 depthwise conv
-        self.scan = DepthwiseScan1D(channels, kernel_size=5)
+        # 增大 kernel_size 到 31 以捕捉频域长程依赖 (101 bins)
+        self.scan = DepthwiseScan1D(channels, kernel_size=31)
         self._sanity_checked = False
     
     def forward(self, x):
@@ -470,6 +471,21 @@ class FiLMGenerator1D(nn.Module):
                     nn.Conv1d(in_channels // 2, out_channels, kernel_size=1),
                 )
             )
+        
+        # 零初始化：确保训练初期 alpha≈1, beta≈0，不破坏主干
+        self._init_film_params()
+    
+    def _init_film_params(self):
+        """零初始化 FiLM 生成器，使初始状态为 H' = H"""
+        for alpha_net in self.alpha_nets:
+            # 最后一层权重为0，偏置为0（由于输出是 log_alpha，exp(0)=1）
+            nn.init.zeros_(alpha_net[-1].weight)
+            nn.init.zeros_(alpha_net[-1].bias)
+        
+        for beta_net in self.beta_nets:
+            # 最后一层权重为0，偏置为0
+            nn.init.zeros_(beta_net[-1].weight)
+            nn.init.zeros_(beta_net[-1].bias)
     
     def forward(self, m: torch.Tensor, target_length: int) -> Dict[str, torch.Tensor]:
         """
