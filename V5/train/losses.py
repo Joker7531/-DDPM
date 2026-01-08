@@ -81,12 +81,12 @@ class ConfidenceRegularization(nn.Module):
     置信图 w 的正则化
     包含:
         - TV (Total Variation) 平滑正则
-        - 非退化约束（避免全 0 或全 1）
+        - 方差惩罚（鼓励 w 有变化，防止塌缩为常数）
     """
-    def __init__(self, tv_weight: float = 0.01, entropy_weight: float = 0.01):
+    def __init__(self, tv_weight: float = 0.01, var_weight: float = 0.1):
         super().__init__()
         self.tv_weight = tv_weight
-        self.entropy_weight = entropy_weight
+        self.var_weight = var_weight  # 方差惩罚权重
     
     def tv_loss(self, w: torch.Tensor) -> torch.Tensor:
         """
@@ -97,17 +97,21 @@ class ConfidenceRegularization(nn.Module):
         diff = w[:, :, 1:] - w[:, :, :-1]
         return torch.abs(diff).mean()
     
-    def entropy_loss(self, w: torch.Tensor) -> torch.Tensor:
+    def variance_penalty(self, w: torch.Tensor) -> torch.Tensor:
         """
-        熵正则（鼓励 w 不全为 0 或 1）
-        直接最小化负熵（最大化熵）
-        熵值越大，说明 w 的分布越均匀
+        方差惩罚：惩罚方差过小，鼓励 w 有变化
+        当 w 全为常数时，方差为 0，损失最大
+        Args:
+            w: (B, 1, L)
+        Returns:
+            loss: 负的对数方差（方差越小损失越大）
         """
+        # 计算每个样本的方差
+        var = w.var(dim=-1, keepdim=True)  # (B, 1, 1)
+        # 惩罚方差过小：方差越小，损失越大
+        # 使用 -log(var + eps) 来惩罚小方差
         eps = 1e-6
-        w_clamp = torch.clamp(w, eps, 1 - eps)
-        entropy = -(w_clamp * torch.log(w_clamp) + (1 - w_clamp) * torch.log(1 - w_clamp))
-        # 最小化负熵 = 最大化熵
-        return -entropy.mean()  # 负号使得最小化这个值等价于最大化熵
+        return -torch.log(var + eps).mean()
     
     def forward(self, w: torch.Tensor) -> tuple:
         """
@@ -117,13 +121,13 @@ class ConfidenceRegularization(nn.Module):
         Returns:
             total_reg: scalar
             tv: scalar (单独返回tv值)
-            ent: scalar (单独返回熵值)
+            var_pen: scalar (单独返回方差惩罚值)
         """
         tv = self.tv_loss(w)
-        ent = self.entropy_loss(w)
+        var_pen = self.variance_penalty(w)
         
-        total_reg = self.tv_weight * tv + self.entropy_weight * ent
-        return total_reg, tv, ent
+        total_reg = self.tv_weight * tv + self.var_weight * var_pen
+        return total_reg, tv, var_pen
 
 
 # ================================
