@@ -20,7 +20,7 @@ def parse_args():
     
     # 数据配置
     # 默认路径：相对于脚本文件向上两级到 3_ICA，再到 Dataset
-    default_dataset = str(Path(__file__).parent.parent.parent / "Dataset")
+    default_dataset = str(Path(__file__).parent.parent / "Dataset")
     parser.add_argument("--dataset_root", type=str, default=default_dataset,
                         help="数据集根目录")
     parser.add_argument("--batch_size", type=int, default=32,
