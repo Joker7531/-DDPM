@@ -1,0 +1,359 @@
+"""
+最小训练入口
+包含 train_one_epoch, validate 和主训练循环
+"""
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from typing import Dict, Optional
+import time
+from pathlib import Path
+import numpy as np
+
+from .losses import compute_losses
+
+
+def set_seed(seed: int = 42):
+    """设置随机种子以确保可复现"""
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    print(f"✓ Random seed set to {seed}")
+
+
+def train_one_epoch(
+    model: nn.Module,
+    train_loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    cfg: dict,
+    device: torch.device,
+    epoch: int,
+    max_batches: Optional[int] = None,
+) -> Dict[str, float]:
+    """
+    训练一个 epoch
+    
+    Args:
+        model: 模型
+        train_loader: 训练数据加载器
+        optimizer: 优化器
+        cfg: 配置字典
+        device: 设备
+        epoch: 当前 epoch
+        max_batches: 最大 batch 数（用于快速测试）
+    
+    Returns:
+        metrics: {"loss": ..., "recon": ..., ...}
+    """
+    model.train()
+    
+    total_loss = 0.0
+    total_recon = 0.0
+    total_conf_reg = 0.0
+    total_consistency = 0.0
+    
+    num_batches = 0
+    
+    for batch_idx, batch in enumerate(train_loader):
+        if max_batches is not None and batch_idx >= max_batches:
+            break
+        
+        # 解析 batch
+        if len(batch) == 2:
+            x_raw, x_clean = batch
+        else:
+            x_raw, x_clean, meta = batch
+        
+        x_raw = x_raw.to(device)
+        x_clean = x_clean.to(device)
+        
+        # 前向传播
+        outputs = model(x_raw)
+        
+        # 计算损失
+        losses = compute_losses(
+            batch=(x_raw, x_clean),
+            outputs=outputs,
+            cfg=cfg,
+            use_consistency=False,
+        )
+        
+        loss = losses["total"]
+        
+        # 反向传播
+        optimizer.zero_grad()
+        loss.backward()
+        
+        # 梯度裁剪（可选）
+        if cfg.get("grad_clip", 0) > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
+        
+        optimizer.step()
+        
+        # 累积统计
+        total_loss += loss.item()
+        total_recon += losses["recon"].item()
+        total_conf_reg += losses["conf_reg"].item()
+        total_consistency += losses["consistency"].item()
+        num_batches += 1
+        
+        # 打印进度
+        if batch_idx % cfg.get("log_interval", 10) == 0:
+            print(f"  Epoch {epoch} [{batch_idx}/{len(train_loader)}] "
+                  f"Loss: {loss.item():.4f} | "
+                  f"Recon: {losses['recon'].item():.4f} | "
+                  f"ConfReg: {losses['conf_reg'].item():.4f}")
+    
+    # 平均指标
+    metrics = {
+        "loss": total_loss / num_batches,
+        "recon": total_recon / num_batches,
+        "conf_reg": total_conf_reg / num_batches,
+        "consistency": total_consistency / num_batches,
+    }
+    
+    return metrics
+
+
+@torch.no_grad()
+def validate(
+    model: nn.Module,
+    val_loader: DataLoader,
+    cfg: dict,
+    device: torch.device,
+    max_batches: Optional[int] = None,
+) -> Dict[str, float]:
+    """
+    验证
+    
+    Args:
+        model: 模型
+        val_loader: 验证数据加载器
+        cfg: 配置字典
+        device: 设备
+        max_batches: 最大 batch 数（用于快速测试）
+    
+    Returns:
+        metrics: {"loss": ..., "recon": ..., ...}
+    """
+    model.eval()
+    
+    total_loss = 0.0
+    total_recon = 0.0
+    total_conf_reg = 0.0
+    
+    num_batches = 0
+    
+    for batch_idx, batch in enumerate(val_loader):
+        if max_batches is not None and batch_idx >= max_batches:
+            break
+        
+        # 解析 batch
+        if len(batch) == 2:
+            x_raw, x_clean = batch
+        else:
+            x_raw, x_clean, meta = batch
+        
+        x_raw = x_raw.to(device)
+        x_clean = x_clean.to(device)
+        
+        # 前向传播
+        outputs = model(x_raw)
+        
+        # 计算损失
+        losses = compute_losses(
+            batch=(x_raw, x_clean),
+            outputs=outputs,
+            cfg=cfg,
+            use_consistency=False,
+        )
+        
+        # 累积统计
+        total_loss += losses["total"].item()
+        total_recon += losses["recon"].item()
+        total_conf_reg += losses["conf_reg"].item()
+        num_batches += 1
+    
+    # 平均指标
+    metrics = {
+        "loss": total_loss / num_batches,
+        "recon": total_recon / num_batches,
+        "conf_reg": total_conf_reg / num_batches,
+    }
+    
+    return metrics
+
+
+def train(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
+    cfg: dict,
+    device: torch.device,
+    save_dir: Optional[Path] = None,
+):
+    """
+    完整训练循环
+    
+    Args:
+        model: 模型
+        train_loader: 训练数据加载器
+        val_loader: 验证数据加载器
+        optimizer: 优化器
+        scheduler: 学习率调度器（可选）
+        cfg: 配置字典
+        device: 设备
+        save_dir: 模型保存目录（可选）
+    """
+    num_epochs = cfg.get("num_epochs", 10)
+    best_val_loss = float("inf")
+    
+    print(f"\n{'='*60}")
+    print(f"Starting training for {num_epochs} epochs")
+    print(f"{'='*60}\n")
+    
+    for epoch in range(1, num_epochs + 1):
+        epoch_start = time.time()
+        
+        # 训练
+        print(f"\n[Epoch {epoch}/{num_epochs}] Training...")
+        train_metrics = train_one_epoch(
+            model, train_loader, optimizer, cfg, device, epoch,
+            max_batches=cfg.get("max_train_batches", None),
+        )
+        
+        # 验证
+        print(f"\n[Epoch {epoch}/{num_epochs}] Validating...")
+        val_metrics = validate(
+            model, val_loader, cfg, device,
+            max_batches=cfg.get("max_val_batches", None),
+        )
+        
+        # 学习率调度
+        if scheduler is not None:
+            scheduler.step()
+        
+        # 打印统计
+        epoch_time = time.time() - epoch_start
+        print(f"\n[Epoch {epoch}/{num_epochs}] Summary:")
+        print(f"  Time: {epoch_time:.2f}s")
+        print(f"  Train Loss: {train_metrics['loss']:.6f} | Recon: {train_metrics['recon']:.6f}")
+        print(f"  Val   Loss: {val_metrics['loss']:.6f} | Recon: {val_metrics['recon']:.6f}")
+        
+        if scheduler is not None:
+            print(f"  LR: {scheduler.get_last_lr()[0]:.6f}")
+        
+        # 保存最佳模型
+        if save_dir is not None and val_metrics['loss'] < best_val_loss:
+            best_val_loss = val_metrics['loss']
+            save_path = save_dir / "best_model.pth"
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': val_metrics['loss'],
+                'cfg': cfg,
+            }, save_path)
+            print(f"  ✓ Saved best model to {save_path}")
+    
+    print(f"\n{'='*60}")
+    print(f"Training completed!")
+    print(f"Best val loss: {best_val_loss:.6f}")
+    print(f"{'='*60}\n")
+
+
+def main_minimal_example():
+    """
+    最小可运行示例（使用随机数据）
+    """
+    print("\n" + "="*60)
+    print("Minimal Training Example (Random Data)")
+    print("="*60 + "\n")
+    
+    # 设置随机种子
+    set_seed(42)
+    
+    # 设备
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}\n")
+    
+    # 配置
+    from ..configs.default import get_default_config
+    cfg = get_default_config()
+    
+    # 模型
+    from ..models import UAR_ACSSNet
+    model = UAR_ACSSNet(
+        segment_length=cfg["segment_length"],
+        unet_base_ch=cfg["unet_base_ch"],
+        unet_levels=cfg["unet_levels"],
+        spec_channels=cfg["spec_channels"],
+        acss_depth=cfg["acss_depth"],
+        num_freq_bins=cfg["num_freq_bins"],
+        dropout=cfg["dropout"],
+    ).to(device)
+    
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}\n")
+    
+    # 优化器
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg["learning_rate"],
+        weight_decay=cfg["weight_decay"],
+    )
+    
+    # 学习率调度器
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=cfg["num_epochs"],
+        eta_min=cfg["learning_rate"] * 0.01,
+    )
+    
+    # 创建随机数据加载器（模拟真实数据集）
+    from torch.utils.data import TensorDataset
+    
+    def make_dummy_loader(num_samples, batch_size):
+        x_raw = torch.randn(num_samples, 1, cfg["segment_length"])
+        x_clean = torch.randn(num_samples, 1, cfg["segment_length"])
+        ds = TensorDataset(x_raw, x_clean)
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=True, drop_last=True)
+        return loader
+    
+    train_loader = make_dummy_loader(num_samples=64, batch_size=8)
+    val_loader = make_dummy_loader(num_samples=32, batch_size=8)
+    
+    print(f"Train batches: {len(train_loader)}")
+    print(f"Val batches: {len(val_loader)}\n")
+    
+    # 训练
+    save_dir = Path("checkpoints")
+    save_dir.mkdir(exist_ok=True)
+    
+    # 快速测试：只训练几个 epoch，每个 epoch 几个 batch
+    cfg["num_epochs"] = 2
+    cfg["max_train_batches"] = 5
+    cfg["max_val_batches"] = 3
+    cfg["log_interval"] = 1
+    
+    train(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        cfg=cfg,
+        device=device,
+        save_dir=save_dir,
+    )
+    
+    print("\n✓ Minimal training example completed!\n")
+
+
+if __name__ == "__main__":
+    main_minimal_example()
