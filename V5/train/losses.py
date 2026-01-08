@@ -100,28 +100,30 @@ class ConfidenceRegularization(nn.Module):
     def entropy_loss(self, w: torch.Tensor) -> torch.Tensor:
         """
         熵正则（鼓励 w 不全为 0 或 1）
-        使用简化的 binary entropy: -[w*log(w) + (1-w)*log(1-w)]
+        直接最小化负熵（最大化熵）
+        熵值越大，说明 w 的分布越均匀
         """
         eps = 1e-6
         w_clamp = torch.clamp(w, eps, 1 - eps)
         entropy = -(w_clamp * torch.log(w_clamp) + (1 - w_clamp) * torch.log(1 - w_clamp))
-        # 最大化熵 = 最小化负熵 = 最小化 -entropy
-        max_entropy = torch.log(torch.tensor(2.0, device=w_clamp.device))
-        return (max_entropy - entropy).mean()
+        # 最小化负熵 = 最大化熵
+        return -entropy.mean()  # 负号使得最小化这个值等价于最大化熵
     
-    def forward(self, w: torch.Tensor) -> torch.Tensor:
+    def forward(self, w: torch.Tensor) -> tuple:
         """
         Args:
             w: (B, 1, L)  置信图
         
         Returns:
             total_reg: scalar
+            tv: scalar (单独返回tv值)
+            ent: scalar (单独返回熵值)
         """
         tv = self.tv_loss(w)
         ent = self.entropy_loss(w)
         
         total_reg = self.tv_weight * tv + self.entropy_weight * ent
-        return total_reg
+        return total_reg, tv, ent
 
 
 # ================================
