@@ -19,9 +19,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train UAR-ACSSNet")
     
     # 数据配置
-    parser.add_argument("--dataset_root", type=str, default="../../Dataset",
+    parser.add_argument("--dataset_root", type=str, default="Dataset",
                         help="数据集根目录")
-    parser.add_argument("--batch_size", type=int, default=16,
+    parser.add_argument("--batch_size", type=int, default=32,
                         help="Batch size")
     parser.add_argument("--segment_length", type=int, default=2048,
                         help="输入信号长度")
@@ -41,7 +41,7 @@ def parse_args():
                         help="Dropout 比例")
     
     # 训练配置
-    parser.add_argument("--num_epochs", type=int, default=50,
+    parser.add_argument("--num_epochs", type=int, default=200,
                         help="训练 epoch 数")
     parser.add_argument("--learning_rate", type=float, default=1e-4,
                         help="初始学习率")
@@ -51,7 +51,7 @@ def parse_args():
                         help="梯度裁剪阈值")
     
     # 其他
-    parser.add_argument("--save_dir", type=str, default="checkpoints",
+    parser.add_argument("--save_dir", type=str, default="output_V5/checkpoints",
                         help="模型保存目录")
     parser.add_argument("--seed", type=int, default=42,
                         help="随机种子")
