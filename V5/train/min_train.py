@@ -69,7 +69,8 @@ def train_one_epoch(
     
     # 创建进度条
     total_iters = min(len(train_loader), max_batches) if max_batches else len(train_loader)
-    pbar = tqdm(enumerate(train_loader), total=total_iters, desc=f"Epoch {epoch}", ncols=120)
+    pbar = tqdm(enumerate(train_loader), total=total_iters, desc=f"Epoch {epoch}", 
+                ncols=120, leave=False, dynamic_ncols=False)
     
     # 是否打印详细信息（每10个epoch或第一个epoch）
     verbose = (epoch == 1 or epoch % 10 == 0)
