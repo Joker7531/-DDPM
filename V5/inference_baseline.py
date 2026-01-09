@@ -86,15 +86,14 @@ def inference_and_visualize(
     # 获取一个batch
     batch = next(iter(val_loader))
     
-    # 解析batch（根据数据集返回格式）
-    if isinstance(batch, (list, tuple)):
-        if len(batch) == 2:
-            x_raw, x_clean = batch
-        else:
-            x_raw, x_clean, _ = batch
-    else:
+    # 解析batch（EEGPairDataset返回tuple: (x_raw, x_clean) 或 (x_raw, x_clean, meta)）
+    if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+        x_raw, x_clean = batch[0], batch[1]
+    elif isinstance(batch, dict):
         x_raw = batch['raw']
         x_clean = batch['clean']
+    else:
+        raise ValueError(f"Unexpected batch format: {type(batch)}, batch={batch}")
     
     x_raw = x_raw.to(device)
     x_clean = x_clean.to(device)
