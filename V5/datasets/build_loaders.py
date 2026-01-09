@@ -17,6 +17,7 @@ def build_dataloaders(
     num_workers: int = 4,
     pin_memory: bool = True,
     return_meta: bool = False,
+    train_transform=None,  # 训练集数据增强
 ) -> Dict[str, DataLoader]:
     """
     构建 train/val/test DataLoaders
@@ -46,6 +47,7 @@ def build_dataloaders(
         stride=train_stride if train_stride else segment_length,
         normalize=normalize,
         return_meta=return_meta,
+        transform=train_transform,  # 数据增强
     )
     
     # Val dataset: 确定性切片（滑窗或中心裁剪）

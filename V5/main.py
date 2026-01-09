@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from configs import get_default_config, print_config
 from datasets import build_dataloaders
+from datasets.transforms import get_train_augmentation
 from models import UAR_ACSSNet
 from train import train, set_seed
 
@@ -99,6 +100,15 @@ def main():
     
     # 构建数据加载器
     print("Loading dataset...")
+    
+    # 构建训练集数据增强
+    train_transform = get_train_augmentation(cfg)
+    if train_transform is not None:
+        print(f"✓ Data augmentation enabled:")
+        print(f"    Flip prob: {cfg.get('aug_flip_prob', 0.5)}")
+        print(f"    Scale range: {cfg.get('aug_scale_range', (0.8, 1.2))}")
+        print(f"    Time shift: ±{cfg.get('aug_time_shift', 100)} samples")
+    
     loaders = build_dataloaders(
         root=cfg["dataset_root"],
         batch_size=cfg["batch_size"],
@@ -110,6 +120,7 @@ def main():
         num_workers=cfg["num_workers"],
         pin_memory=cfg["pin_memory"],
         return_meta=False,
+        train_transform=train_transform,  # 数据增强
     )
     
     # 创建模型

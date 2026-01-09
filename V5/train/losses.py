@@ -1,6 +1,6 @@
 """
 损失函数模块
-包含重建损失、门控/置信正则、一致性损失等
+包含重建损失、门控/置信正则、一致性损失、频域损失等
 """
 import torch
 import torch.nn as nn
@@ -38,6 +38,87 @@ class CharbonnierLoss(nn.Module):
             # 加权损失（w 越小越不强迫拟合）
             loss = loss * weight
         
+        return loss.mean()
+
+
+class FrequencyDomainLoss(nn.Module):
+    """
+    频域损失：在STFT域计算重建误差
+    使用与模型相同的STFT参数
+    """
+    def __init__(
+        self,
+        fs: int = 500,
+        n_fft: int = 512,
+        hop_length: int = 64,
+        win_length: int = 156,
+        loss_type: str = "l1",  # "l1", "l2", "charbonnier"
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.fs = fs
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.win_length = win_length
+        self.loss_type = loss_type
+        self.eps = eps
+        
+        # 使用Hann窗
+        self.register_buffer('window', torch.hann_window(win_length))
+    
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pred: (B, 1, L) 预测时域信号
+            target: (B, 1, L) 目标时域信号
+        
+        Returns:
+            loss: scalar
+        """
+        B, C, L = pred.shape
+        assert C == 1, "Expected single channel"
+        
+        # Squeeze channel维度
+        pred_1d = pred.squeeze(1)  # (B, L)
+        target_1d = target.squeeze(1)  # (B, L)
+        
+        # 计算STFT (返回复数)
+        pred_stft = torch.stft(
+            pred_1d,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=self.window,
+            return_complex=True,
+            center=True,
+        )  # (B, freq_bins, time_frames)
+        
+        target_stft = torch.stft(
+            target_1d,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=self.window,
+            return_complex=True,
+            center=True,
+        )
+        
+        # 计算幅度谱
+        pred_mag = torch.abs(pred_stft)  # (B, F, T)
+        target_mag = torch.abs(target_stft)
+        
+        # 计算损失
+        if self.loss_type == "l1":
+            loss = F.l1_loss(pred_mag, target_mag)
+        elif self.loss_type == "l2":
+            loss = F.mse_loss(pred_mag, target_mag)
+        elif self.loss_type == "charbonnier":
+            diff = pred_mag - target_mag
+            loss = torch.sqrt(diff ** 2 + self.eps ** 2).mean()
+        else:
+            raise ValueError(f"Unknown loss_type: {self.loss_type}")
+        
+        return loss
         return loss.mean()
 
 
@@ -202,7 +283,7 @@ def compute_losses(
     y_hat = outputs["y_hat"]
     w = outputs["w"]
     
-    # 1) 重建损失
+    # 1) 时域重建损失
     recon_criterion = CharbonnierLoss(eps=cfg.get("charbonnier_eps", 1e-6))
     
     # Warm-up期间禁用weighted_recon，避免w接近0导致loss消失
@@ -219,6 +300,19 @@ def compute_losses(
     else:
         recon_loss = recon_criterion(y_hat, x_clean, weight=None)
     
+    # 1.5) 频域重建损失（可选）
+    freq_loss = torch.tensor(0.0, device=y_hat.device)
+    if cfg.get("use_freq_loss", False):
+        freq_criterion = FrequencyDomainLoss(
+            fs=cfg.get("stft_fs", 500),
+            n_fft=cfg.get("stft_n_fft", 512),
+            hop_length=cfg.get("stft_hop", 64),
+            win_length=cfg.get("stft_win", 156),
+            loss_type=cfg.get("freq_loss_type", "l1"),
+            eps=cfg.get("charbonnier_eps", 1e-6),
+        )
+        freq_loss = freq_criterion(y_hat, x_clean)
+    
     # 2) 置信图正则
     conf_reg_criterion = ConfidenceRegularization(
         tv_weight=cfg.get("tv_weight", 0.01),
@@ -234,13 +328,13 @@ def compute_losses(
         consistency_loss = consistency_criterion(y_hat, y_hat_aug)
     
     # Warm-up调度：前N个epoch置信图正则权重为0
-    current_epoch = cfg.get("_current_epoch", 0)
     warmup_epochs = cfg.get("conf_warmup_epochs", 0)
     conf_weight = 0.0 if current_epoch < warmup_epochs else cfg.get("conf_reg_weight", 0.1)
     
     # 总损失
     total_loss = (
         cfg.get("recon_weight", 1.0) * recon_loss +
+        cfg.get("freq_loss_weight", 0.1) * freq_loss +
         conf_weight * conf_reg_loss +
         cfg.get("consistency_weight", 0.0) * consistency_loss
     )
@@ -248,6 +342,7 @@ def compute_losses(
     losses = {
         "total": total_loss,
         "recon": recon_loss,
+        "freq": freq_loss,
         "conf_reg": conf_reg_loss,
         "conf_reg_weighted": conf_weight * conf_reg_loss,  # 实际贡献
         "tv": tv_loss,

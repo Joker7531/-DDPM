@@ -33,6 +33,7 @@ class EEGPairDataset(Dataset):
         stride: Optional[int] = None,
         normalize: Literal["none", "zscore_per_sample"] = "zscore_per_sample",
         return_meta: bool = False,
+        transform=None,  # 数据增强
     ):
         super().__init__()
         self.root = Path(root)
@@ -42,6 +43,7 @@ class EEGPairDataset(Dataset):
         self.stride = stride if stride is not None else (segment_length if segment_length else 0)
         self.normalize = normalize
         self.return_meta = return_meta
+        self.transform = transform  # 数据增强（仅对训练集应用）
         
         # 构建文件路径
         self.raw_dir = self.root / split / "raw"
@@ -245,6 +247,10 @@ class EEGPairDataset(Dataset):
         # 转 tensor
         x_raw_t = torch.from_numpy(seg_raw).float()
         x_clean_t = torch.from_numpy(seg_clean).float()
+        
+        # 应用数据增强（仅训练集）
+        if self.transform is not None and self.split == "train":
+            x_raw_t, x_clean_t = self.transform(x_raw_t, x_clean_t)
         
         # 构建 meta
         meta = {

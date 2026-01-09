@@ -18,16 +18,24 @@ def get_default_config():
         "num_workers": 4,                 # DataLoader workers
         "pin_memory": True,               # 是否 pin memory
         
-        # 数据增强（可选）
+        # 数据增强（只在训练时应用）
         "train_stride": 512,             # train 滑窗步长（None 表示随机裁剪）
         "val_stride": 1024,               # val 滑窗步长（建议 segment_length // 2）
         "test_stride": 1024,              # test 滑窗步长
+        
+        # 数据增强
+        "use_augmentation": True,         # 启用数据增强
+        "aug_flip_prob": 0.5,             # 极性翻转概率
+        "aug_scale_range": [0.8, 1.2],   # 幅度缩放范围
+        "aug_time_shift": 100,            # 时移最大范围（样本点数）
+        "aug_noise_prob": 0.0,            # 添加噪声概率
+        "aug_noise_std": 0.01,            # 噪声相对标准差
         
         # ==================
         # 模型配置
         # ==================
         # Baseline Mode: 仅使用时域U-Net，关闭时频分支和FiLM融合
-        "baseline_mode": True,            # True: 只训练U-Net | False: 完整UAR-ACSSNet
+        "baseline_mode": False,            # True: 只训练U-Net | False: 完整UAR-ACSSNet
         
         # U-Net
         "unet_base_ch": 32,               # U-Net 基础通道数
@@ -45,7 +53,12 @@ def get_default_config():
         # 损失配置
         # ==================
         "charbonnier_eps": 1e-6,          # Charbonnier loss epsilon
-        "use_weighted_recon": False,      # 使用置信图加权重建损失（baseline模式下设为False）
+        "use_weighted_recon": False,      # 使用置信图加权重建损失（warm-up后启用）
+        
+        # 频域损失
+        "use_freq_loss": True,            # 启用STFT频域损失
+        "freq_loss_type": "l1",           # 频域损失类型: "l1", "l2", "charbonnier"
+        "freq_loss_weight": 0.1,          # 频域损失权重
         
         # 置信图正则
         "tv_weight": 0.01,                # TV 平滑正则权重
