@@ -197,8 +197,10 @@ def validate(
     total_loss = 0.0
     total_recon = 0.0
     total_conf_reg = 0.0
+    total_conf_reg_weighted = 0.0
     total_tv = 0.0
     total_boundary = 0.0
+    conf_weight_value = 0.0
     
     w_means = []
     w_stds = []
