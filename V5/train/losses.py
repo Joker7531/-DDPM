@@ -82,13 +82,16 @@ class FrequencyDomainLoss(nn.Module):
         pred_1d = pred.squeeze(1)  # (B, L)
         target_1d = target.squeeze(1)  # (B, L)
         
+        # 确保window在正确的设备上
+        window = self.window.to(pred.device)
+        
         # 计算STFT (返回复数)
         pred_stft = torch.stft(
             pred_1d,
             n_fft=self.n_fft,
             hop_length=self.hop_length,
             win_length=self.win_length,
-            window=self.window,
+            window=window,
             return_complex=True,
             center=True,
         )  # (B, freq_bins, time_frames)
@@ -98,7 +101,7 @@ class FrequencyDomainLoss(nn.Module):
             n_fft=self.n_fft,
             hop_length=self.hop_length,
             win_length=self.win_length,
-            window=self.window,
+            window=window,
             return_complex=True,
             center=True,
         )
