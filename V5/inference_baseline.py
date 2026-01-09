@@ -11,9 +11,9 @@ import matplotlib.pyplot as plt
 # 添加项目路径
 sys.path.insert(0, str(Path(__file__).parent))
 
-from models.uar_acssnet import UAR_ACSSNet
-from datasets.build_loaders import build_loaders
-from configs.default import get_default_config
+from models import UAR_ACSSNet
+from datasets import build_dataloaders
+from configs import get_default_config
 
 
 def load_model(checkpoint_path, device='cuda'):
@@ -242,7 +242,7 @@ def main():
     
     # 构建数据加载器
     print(f"\n📊 Loading validation dataset from: {cfg['dataset_root']}")
-    _, val_loader, _ = build_loaders(
+    _, val_loader, _ = build_dataloaders(
         dataset_root=cfg['dataset_root'],
         batch_size=cfg['batch_size'],
         segment_length=cfg['segment_length'],
