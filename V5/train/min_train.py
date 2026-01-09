@@ -70,10 +70,10 @@ def train_one_epoch(
     # 创建进度条
     total_iters = min(len(train_loader), max_batches) if max_batches else len(train_loader)
     pbar = tqdm(enumerate(train_loader), total=total_iters, desc=f"Epoch {epoch}", 
-                ncols=120, leave=False, mininterval=1.0, miniters=50)
+                ncols=120, leave=False)
     
-    # 是否打印详细信息（每10个epoch或第一个epoch）
-    verbose = (epoch == 1 or epoch % 10 == 0)
+    # 是否打印详细信息（仅第一个epoch）
+    verbose = (epoch == 1)
     
     for batch_idx, batch in pbar:
         if max_batches is not None and batch_idx >= max_batches:
@@ -112,23 +112,23 @@ def train_one_epoch(
         if cfg.get("grad_clip", 0) > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
         
-        # 梯度诊断（verbose 模式且第一个 batch）
+        # 梯度诊断（仅第一个epoch的第一个batch，使用tqdm.write避免破坏进度条）
         if verbose and batch_idx == 0:
-            print("\n  === Gradient Diagnostics ===")
+            pbar.write("\n  === Gradient Diagnostics ===")
             # 检查 confidence_head 参数
             for name, param in model.named_parameters():
                 if 'confidence_head' in name:
                     if param.grad is not None:
                         grad_norm = param.grad.norm().item()
-                        print(f"    {name}: requires_grad={param.requires_grad}, grad_norm={grad_norm:.6f}")
+                        pbar.write(f"    {name}: requires_grad={param.requires_grad}, grad_norm={grad_norm:.6f}")
                     else:
-                        print(f"    {name}: requires_grad={param.requires_grad}, grad=None")
+                        pbar.write(f"    {name}: requires_grad={param.requires_grad}, grad=None")
             
             # 检查 w 的统计
             if 'w' in outputs:
                 w_data = outputs['w']
-                print(f"    w: mean={w_data.mean().item():.4f}, std={w_data.std().item():.4f}, "
-                      f"min={w_data.min().item():.4f}, max={w_data.max().item():.4f}")
+                pbar.write(f"    w: mean={w_data.mean().item():.4f}, std={w_data.std().item():.4f}, "
+                          f"min={w_data.min().item():.4f}, max={w_data.max().item():.4f}\n")
         
         optimizer.step()
         
