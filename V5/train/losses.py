@@ -205,7 +205,12 @@ def compute_losses(
     # 1) 重建损失
     recon_criterion = CharbonnierLoss(eps=cfg.get("charbonnier_eps", 1e-6))
     
-    if cfg.get("use_weighted_recon", False):
+    # Warm-up期间禁用weighted_recon，避免w接近0导致loss消失
+    current_epoch = cfg.get("_current_epoch", 0)
+    warmup_epochs = cfg.get("conf_warmup_epochs", 0)
+    use_weighted = cfg.get("use_weighted_recon", False) and (current_epoch >= warmup_epochs)
+    
+    if use_weighted:
         # 使用置信图加权
         # w 的语义：接近 0.5 表示"不确定"，接近边界（0或1）表示"确定"
         # 这里我们直接用 w 作为权重：w 大 → 更重视该位置的重建
