@@ -214,7 +214,7 @@ def main():
     parser.add_argument('--checkpoint', type=str, default='output_V5/checkpoints/best_model.pth',
                         help='Path to checkpoint file')
     parser.add_argument('--dataset_root', type=str, default='../../Dataset',
-                        help='Dataset root directory')
+                        help='Dataset root directory (contains train/val/test folders)')
     parser.add_argument('--num_samples', type=int, default=4,
                         help='Number of samples to visualize')
     parser.add_argument('--output', type=str, default='inference_baseline_vis.png',
@@ -237,13 +237,13 @@ def main():
     model, cfg = load_model(checkpoint_path, device)
     
     # 更新数据集路径
-    cfg['dataset_root'] = args.dataset_root
+    dataset_root = args.dataset_root
     cfg['batch_size'] = max(4, args.num_samples)  # 至少加载足够的样本
     
     # 构建数据加载器
-    print(f"\n📊 Loading validation dataset from: {cfg['dataset_root']}")
-    _, val_loader, _ = build_dataloaders(
-        dataset_root=cfg['dataset_root'],
+    print(f"\n📊 Loading validation dataset from: {dataset_root}")
+    train_loader, val_loader, test_loader = build_dataloaders(
+        root=dataset_root,  # 正确的参数名
         batch_size=cfg['batch_size'],
         segment_length=cfg['segment_length'],
         train_stride=cfg.get('train_stride'),
