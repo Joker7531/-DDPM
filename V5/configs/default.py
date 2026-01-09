@@ -26,11 +26,14 @@ def get_default_config():
         # ==================
         # 模型配置
         # ==================
+        # Baseline Mode: 仅使用时域U-Net，关闭时频分支和FiLM融合
+        "baseline_mode": True,            # True: 只训练U-Net | False: 完整UAR-ACSSNet
+        
         # U-Net
         "unet_base_ch": 32,               # U-Net 基础通道数
         "unet_levels": 4,                 # U-Net 编码器层数
         
-        # 时频分支
+        # 时频分支（仅在baseline_mode=False时使用）
         "spec_channels": 64,              # 谱图编码器输出通道数
         "acss_depth": 3,                  # ACSSBlock 堆叠层数
         "num_freq_bins": 101,             # STFT 频率 bin 数量（1-100Hz @ fs=500, n_fft=512）
@@ -42,7 +45,7 @@ def get_default_config():
         # 损失配置
         # ==================
         "charbonnier_eps": 1e-6,          # Charbonnier loss epsilon
-        "use_weighted_recon": True,       # 使用置信图加权重建损失（让 w 参与任务闭环）
+        "use_weighted_recon": False,      # 使用置信图加权重建损失（baseline模式下设为False）
         
         # 置信图正则
         "tv_weight": 0.01,                # TV 平滑正则权重

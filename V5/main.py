@@ -122,7 +122,13 @@ def main():
         acss_depth=cfg["acss_depth"],
         num_freq_bins=cfg["num_freq_bins"],
         dropout=cfg["dropout"],
+        baseline_mode=cfg.get("baseline_mode", False),
     ).to(device)
+    
+    if cfg.get("baseline_mode", False):
+        print("🔹 Baseline Mode: Using pure U-Net (no FiLM/ACSS)")
+    else:
+        print("🔹 Full Mode: UAR-ACSSNet with FiLM modulation")
     
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

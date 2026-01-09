@@ -545,10 +545,12 @@ class UAR_ACSSNet(nn.Module):
         acss_depth: int = 3,
         num_freq_bins: int = 103,  # 1-100 Hz @ 500Hz, n_fft=512 -> 103 bins
         dropout: float = 0.0,
+        baseline_mode: bool = False,  # 仅使用U-Net，不使用时频分支
     ):
         super().__init__()
         self.segment_length = segment_length
         self.num_freq_bins = num_freq_bins
+        self.baseline_mode = baseline_mode
         
         # STFT 处理器（固定参数）
         self.stft_proc = STFTProcessor(
@@ -568,42 +570,44 @@ class UAR_ACSSNet(nn.Module):
             dropout=dropout,
         )
         
-        # 时频分支: SpecEncoder2D
-        self.spec_encoder = SpecEncoder2D(
-            in_freq=num_freq_bins,
-            out_channels=spec_channels,
-            dropout=dropout,
-        )
-        
-        # ACSSBlock 堆叠
-        self.acss_blocks = nn.ModuleList([
-            ACSSBlock2D(spec_channels, dropout) for _ in range(acss_depth)
-        ])
-        
-        # 跨域融合: FiLM Generator
-        # 从 (B, C, T, F) -> pool over F -> (B, C, T)
-        self.film_pool = nn.AdaptiveAvgPool2d((None, 1))  # (B, C, T, F) -> (B, C, T, 1)
-        
-        # FiLM 生成器（为 U-Net decoder 的前两层生成参数）
-        # 目标通道数需要与 U-Net decoder 对应层匹配
-        # decoder 第 0 层输出: unet_base_ch * 2^(levels-1)
-        # decoder 第 1 层输出: unet_base_ch * 2^(levels-2)
-        film_target_ch_0 = unet_base_ch * (2 ** (unet_levels - 1))
-        film_target_ch_1 = unet_base_ch * (2 ** (unet_levels - 2))
-        
-        self.film_gen_0 = FiLMGenerator1D(spec_channels, film_target_ch_0, num_layers=1)
-        self.film_gen_1 = FiLMGenerator1D(spec_channels, film_target_ch_1, num_layers=1)
-        
-        # 置信图生成（从 ACSS 输出）
-        self.confidence_head = nn.Sequential(
-            nn.AdaptiveAvgPool2d((None, 1)),  # (B, C, T, F) -> (B, C, T, 1)
-            nn.Conv2d(spec_channels, spec_channels // 2, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(spec_channels // 2, 1, kernel_size=1),
-        )
-        # Zero initialization for confidence_head last layer
-        nn.init.zeros_(self.confidence_head[-1].weight)
-        nn.init.zeros_(self.confidence_head[-1].bias)
+        # 仅在非baseline模式下初始化时频分支
+        if not baseline_mode:
+            # 时频分支: SpecEncoder2D
+            self.spec_encoder = SpecEncoder2D(
+                in_freq=num_freq_bins,
+                out_channels=spec_channels,
+                dropout=dropout,
+            )
+            
+            # ACSSBlock 堆叠
+            self.acss_blocks = nn.ModuleList([
+                ACSSBlock2D(spec_channels, dropout) for _ in range(acss_depth)
+            ])
+            
+            # 跨域融合: FiLM Generator
+            # 从 (B, C, T, F) -> pool over F -> (B, C, T)
+            self.film_pool = nn.AdaptiveAvgPool2d((None, 1))  # (B, C, T, F) -> (B, C, T, 1)
+            
+            # FiLM 生成器（为 U-Net decoder 的前两层生成参数）
+            # 目标通道数需要与 U-Net decoder 对应层匹配
+            # decoder 第 0 层输出: unet_base_ch * 2^(levels-1)
+            # decoder 第 1 层输出: unet_base_ch * 2^(levels-2)
+            film_target_ch_0 = unet_base_ch * (2 ** (unet_levels - 1))
+            film_target_ch_1 = unet_base_ch * (2 ** (unet_levels - 2))
+            
+            self.film_gen_0 = FiLMGenerator1D(spec_channels, film_target_ch_0, num_layers=1)
+            self.film_gen_1 = FiLMGenerator1D(spec_channels, film_target_ch_1, num_layers=1)
+            
+            # 置信图生成（从 ACSS 输出）
+            self.confidence_head = nn.Sequential(
+                nn.AdaptiveAvgPool2d((None, 1)),  # (B, C, T, F) -> (B, C, T, 1)
+                nn.Conv2d(spec_channels, spec_channels // 2, kernel_size=1),
+                nn.GELU(),
+                nn.Conv2d(spec_channels // 2, 1, kernel_size=1),
+            )
+            # Zero initialization for confidence_head last layer
+            nn.init.zeros_(self.confidence_head[-1].weight)
+            nn.init.zeros_(self.confidence_head[-1].bias)
     
     def forward(self, x_raw: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
@@ -622,7 +626,32 @@ class UAR_ACSSNet(nn.Module):
         assert L == self.segment_length, f"Expected length {self.segment_length}, got {L}"
         
         # ==================
-        # 时频分支
+        # Baseline模式：仅使用U-Net
+        # ==================
+        if self.baseline_mode:
+            # 直接使用U-Net，不使用FiLM调制
+            y_hat = self.unet(x_raw, film_params=None)  # (B, 1, L)
+            
+            # 返回简化输出（w固定为0.5，不参与训练）
+            w = torch.ones_like(y_hat) * 0.5
+            g_freq_avg = torch.zeros(B, 1, 1, device=x_raw.device)  # 占位符
+            
+            # 详细统计（仅首次）
+            if not hasattr(self, '_output_checked'):
+                print(f"\n  [Baseline Mode] Model Output Check:")
+                print(f"    y_hat: shape={y_hat.shape}, range=[{y_hat.min():.3f}, {y_hat.max():.3f}]")
+                print(f"    w: fixed at 0.5 (not trainable)")
+                print(f"    ✓ Using pure U-Net without FiLM modulation")
+                self._output_checked = True
+            
+            return {
+                "y_hat": y_hat,
+                "w": w,
+                "g_freq": g_freq_avg,
+            }
+        
+        # ==================
+        # 完整模式：时频分支 + FiLM融合
         # ==================
         
         # STFT: (B, 1, L) -> (B, F_sel, T)
