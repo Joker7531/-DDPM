@@ -241,7 +241,7 @@ def main():
     
     # 构建数据加载器
     print(f"\n📊 Loading validation dataset from: {dataset_root}")
-    train_loader, val_loader, test_loader = build_dataloaders(
+    loaders = build_dataloaders(
         root=dataset_root,  # 正确的参数名
         batch_size=cfg['batch_size'],
         segment_length=cfg['segment_length'],
@@ -254,6 +254,7 @@ def main():
         return_meta=False,
     )
     
+    val_loader = loaders["val"]
     print(f"✓ Validation loader ready (batch_size={cfg['batch_size']})")
     
     # 推理并可视化
