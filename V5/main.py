@@ -32,11 +32,11 @@ def parse_args():
                         help="DataLoader workers")
     
     # 模型配置
-    parser.add_argument("--unet_base_ch", type=int, default=32,
+    parser.add_argument("--unet_base_ch", type=int, default=16,
                         help="U-Net 基础通道数")
-    parser.add_argument("--unet_levels", type=int, default=4,
+    parser.add_argument("--unet_levels", type=int, default=3,
                         help="U-Net 编码器层数")
-    parser.add_argument("--spec_channels", type=int, default=64,
+    parser.add_argument("--spec_channels", type=int, default=16,
                         help="谱图编码器输出通道数")
     parser.add_argument("--acss_depth", type=int, default=3,
                         help="ACSSBlock 堆叠层数")

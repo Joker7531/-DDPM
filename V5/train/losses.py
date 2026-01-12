@@ -43,8 +43,8 @@ class CharbonnierLoss(nn.Module):
 
 class FrequencyDomainLoss(nn.Module):
     """
-    频域损失：在STFT域计算重建误差
-    使用与模型相同的STFT参数
+    频域损失：在STFT域计算重建误差（单分辨率，保留以兼容旧配置）
+    建议改用 MultiResolutionSTFTLoss
     """
     def __init__(
         self,
@@ -52,7 +52,7 @@ class FrequencyDomainLoss(nn.Module):
         n_fft: int = 512,
         hop_length: int = 64,
         win_length: int = 156,
-        loss_type: str = "l1",  # "l1", "l2", "charbonnier"
+        loss_type: str = "log_L1",  # "l1", "l2", "charbonnier", "log_L1"
         eps: float = 1e-6,
     ):
         super().__init__()
@@ -111,18 +111,104 @@ class FrequencyDomainLoss(nn.Module):
         target_mag = torch.abs(target_stft)
         
         # 计算损失
-        if self.loss_type == "l1":
+        lt = self.loss_type
+        if lt == "l1":
             loss = F.l1_loss(pred_mag, target_mag)
-        elif self.loss_type == "l2":
+        elif lt == "l2":
             loss = F.mse_loss(pred_mag, target_mag)
-        elif self.loss_type == "charbonnier":
+        elif lt == "charbonnier":
             diff = pred_mag - target_mag
             loss = torch.sqrt(diff ** 2 + self.eps ** 2).mean()
+        elif lt == "log_L1" or lt == "log_l1":
+            # 使用 log1p 稳定变换（避免 log(0) 问题）
+            pred_logmag = torch.log1p(pred_mag)
+            target_logmag = torch.log1p(target_mag)
+            loss = F.l1_loss(pred_logmag, target_logmag)
         else:
             raise ValueError(f"Unknown loss_type: {self.loss_type}")
         
         return loss
-        return loss.mean()
+
+class STFTLoss(nn.Module):
+    """
+    单组分辨率的 STFT Loss 计算单元（谱收敛 + 对数幅值）
+    """
+    def __init__(self, n_fft: int, hop_length: int, win_length: int):
+        super().__init__()
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.win_length = win_length
+        self.register_buffer('window', torch.hann_window(win_length))
+    
+    def forward(self, pred_1d: torch.Tensor, target_1d: torch.Tensor) -> torch.Tensor:
+        # 确保 window 在正确设备
+        window = self.window.to(pred_1d.device)
+        
+        # STFT（返回复数）
+        pred_stft = torch.stft(
+            pred_1d,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=window,
+            return_complex=True,
+            center=True,
+        )
+        target_stft = torch.stft(
+            target_1d,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window=window,
+            return_complex=True,
+            center=True,
+        )
+        
+        # Magnitude
+        eps = 1e-7
+        pred_mag = torch.abs(pred_stft) + eps
+        target_mag = torch.abs(target_stft) + eps
+        
+        # 1) Spectral Convergence
+        sc_loss = torch.norm(target_mag - pred_mag, p='fro') / torch.norm(target_mag, p='fro')
+        
+        # 2) Log Magnitude L1
+        log_mag_loss = F.l1_loss(torch.log(pred_mag), torch.log(target_mag))
+        
+        return sc_loss + log_mag_loss
+
+class MultiResolutionSTFTLoss(nn.Module):
+    """
+    多分辨率 STFT Loss (MR-STFT)
+    默认参数参考常见语音增强设置，可在 cfg 中覆盖：
+      - mrstft_fft_sizes
+      - mrstft_hop_sizes
+      - mrstft_win_lengths
+    """
+    def __init__(
+        self,
+        fft_sizes = [1024, 512, 128],
+        hop_sizes = [120, 50, 10],
+        win_lengths = [600, 240, 60],
+    ):
+        super().__init__()
+        assert len(fft_sizes) == len(hop_sizes) == len(win_lengths), 'MR-STFT parameter lists must have same length'
+        
+        self.stft_losses = nn.ModuleList([
+            STFTLoss(fs, hop, win) for fs, hop, win in zip(fft_sizes, hop_sizes, win_lengths)
+        ])
+    
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # Squeeze channel dim if present
+        if pred.dim() == 3:
+            pred = pred.squeeze(1)
+            target = target.squeeze(1)
+        
+        total = pred.new_tensor(0.0)
+        for f in self.stft_losses:
+            total = total + f(pred, target)
+        
+        return total / len(self.stft_losses)
 
 
 class HuberLoss(nn.Module):
@@ -306,13 +392,14 @@ def compute_losses(
     # 1.5) 频域重建损失（可选）
     freq_loss = torch.tensor(0.0, device=y_hat.device)
     if cfg.get("use_freq_loss", False):
-        freq_criterion = FrequencyDomainLoss(
-            fs=cfg.get("stft_fs", 500),
-            n_fft=cfg.get("stft_n_fft", 512),
-            hop_length=cfg.get("stft_hop", 64),
-            win_length=cfg.get("stft_win", 156),
-            loss_type=cfg.get("freq_loss_type", "l1"),
-            eps=cfg.get("charbonnier_eps", 1e-6),
+        # 使用多分辨率 STFT Loss；可从 cfg 覆盖默认参数
+        mr_fft = cfg.get("mrstft_fft_sizes", [1024, 512, 128])
+        mr_hop = cfg.get("mrstft_hop_sizes", [120, 50, 10])
+        mr_win = cfg.get("mrstft_win_lengths", [600, 240, 60])
+        freq_criterion = MultiResolutionSTFTLoss(
+            fft_sizes=mr_fft,
+            hop_sizes=mr_hop,
+            win_lengths=mr_win,
         )
         freq_loss = freq_criterion(y_hat, x_clean)
     
@@ -337,7 +424,7 @@ def compute_losses(
     # 总损失
     total_loss = (
         cfg.get("recon_weight", 1.0) * recon_loss +
-        cfg.get("freq_loss_weight", 0.1) * freq_loss +
+        cfg.get("freq_loss_weight", 0.5) * freq_loss +
         conf_weight * conf_reg_loss +
         cfg.get("consistency_weight", 0.0) * consistency_loss
     )

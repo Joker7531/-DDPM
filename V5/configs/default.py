@@ -58,7 +58,7 @@ def get_default_config():
         # 频域损失
         "use_freq_loss": True,            # 启用STFT频域损失
         "freq_loss_type": "l1",           # 频域损失类型: "l1", "l2", "charbonnier"
-        "freq_loss_weight": 0.1,          # 频域损失权重
+        "freq_loss_weight": 0.5,          # 频域损失权重
         
         # 置信图正则
         "tv_weight": 0.01,                # TV 平滑正则权重
