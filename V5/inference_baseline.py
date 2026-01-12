@@ -11,12 +11,12 @@ import matplotlib.pyplot as plt
 # 添加项目路径
 sys.path.insert(0, str(Path(__file__).parent))
 
-from models import UAR_ACSSNet
-from datasets import build_dataloaders
-from configs import get_default_config
+from models.uar_acssnet import UAR_ACSSNet
+from datasets.build_loaders import build_dataloaders
+from configs.default import get_default_config
 
 
-def load_model(checkpoint_path, device='cuda'):
+def load_model(checkpoint_path, device='cuda', baseline_mode=None):
     """
     加载训练好的模型
     
@@ -40,6 +40,8 @@ def load_model(checkpoint_path, device='cuda'):
         print("✓ Using default config")
     
     # 创建模型
+    # 允许通过入参覆盖 baseline_mode；否则使用配置中的值，默认完整模式(False)
+    bm = cfg.get("baseline_mode", False) if baseline_mode is None else baseline_mode
     model = UAR_ACSSNet(
         segment_length=cfg.get("segment_length", 2048),
         unet_base_ch=cfg.get("unet_base_ch", 32),
@@ -48,7 +50,7 @@ def load_model(checkpoint_path, device='cuda'):
         acss_depth=cfg.get("acss_depth", 3),
         num_freq_bins=cfg.get("num_freq_bins", 101),
         dropout=cfg.get("dropout", 0.0),
-        baseline_mode=cfg.get("baseline_mode", True),
+        baseline_mode=bm,
     ).to(device)
     
     # 加载权重
@@ -56,10 +58,15 @@ def load_model(checkpoint_path, device='cuda'):
     model.eval()
     
     print(f"✓ Loaded model from epoch {ckpt.get('epoch', 'unknown')}")
-    print(f"✓ Best val loss: {ckpt.get('val_loss', 'unknown'):.6f}")
+    val_loss = ckpt.get('val_loss', None)
+    if isinstance(val_loss, (float, int)):
+        print(f"✓ Best val loss: {val_loss:.6f}")
+    else:
+        print("✓ Best val loss: unknown")
     
     total_params = sum(p.numel() for p in model.parameters())
     print(f"✓ Total parameters: {total_params:,}")
+    print(f"✓ Mode: {'Full UAR-ACSSNet' if not model.baseline_mode else 'Baseline U-Net'}")
     
     return model, cfg
 
@@ -156,8 +163,8 @@ def inference_and_visualize(
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"\n✅ Visualization saved to: {save_path}")
     
-    # 如果有confidence map，额外保存
-    if w is not None and not model.baseline_mode:
+    # 如果有confidence map，额外保存（不再依赖 baseline_mode）
+    if w is not None:
         save_confidence_map(w, x_raw, num_samples, save_path.replace('.png', '_confidence.png'))
 
 
@@ -220,6 +227,8 @@ def main():
                         help='Output visualization file path')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device to use (cuda/cpu)')
+    parser.add_argument('--baseline', action='store_true',
+                        help='Force baseline mode for inference (default: full mode)')
     args = parser.parse_args()
     
     # 检查设备
@@ -233,7 +242,8 @@ def main():
         print(f"   Please train the model first or specify correct checkpoint path")
         return
     
-    model, cfg = load_model(checkpoint_path, device)
+    # 加载模型；默认完整模式，除非用户显式指定 --baseline
+    model, cfg = load_model(checkpoint_path, device, baseline_mode=args.baseline)
     
     # 更新数据集路径
     dataset_root = args.dataset_root
