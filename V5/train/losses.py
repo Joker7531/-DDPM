@@ -495,7 +495,7 @@ def compute_losses(
         )
         freq_loss = freq_criterion(y_hat, x_clean)
     
-    # 2) 置信图正则
+    # 2) 置信图正则（仅用于监控，不影响训练）
     conf_reg_criterion = ConfidenceRegularization(
         tv_weight=cfg.get("tv_weight", 0.01),
         boundary_weight=cfg.get("boundary_weight", 0.1),
@@ -509,9 +509,8 @@ def compute_losses(
         y_hat_aug = outputs_aug["y_hat"]
         consistency_loss = consistency_criterion(y_hat, y_hat_aug)
     
-    # Warm-up调度：前N个epoch置信图正则权重为0
-    warmup_epochs = cfg.get("conf_warmup_epochs", 0)
-    conf_weight = 0.0 if current_epoch < warmup_epochs else cfg.get("conf_reg_weight", 0.1)
+    # 置信度正则权重：已禁用（方法论缺陷）
+    conf_weight = 0.0  # 强制为 0，不参与梯度优化
     
     # 总损失
     total_loss = (
