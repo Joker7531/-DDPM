@@ -169,8 +169,11 @@ class STFTLoss(nn.Module):
         pred_mag = torch.abs(pred_stft) + eps
         target_mag = torch.abs(target_stft) + eps
         
-        # 1) Spectral Convergence
-        sc_loss = torch.norm(target_mag - pred_mag, p='fro') / torch.norm(target_mag, p='fro')
+        # 1) Spectral Convergence (安全版本，防止除零)
+        numer = torch.norm(target_mag - pred_mag, p='fro')
+        denom = torch.norm(target_mag, p='fro')
+        denom = torch.clamp(denom, min=1e-5)  # 安全夹断，防止除以极小值
+        sc_loss = numer / denom
         
         # 2) Log Magnitude L1
         log_mag_loss = F.l1_loss(torch.log(pred_mag), torch.log(target_mag))
@@ -385,7 +388,9 @@ def compute_losses(
         # w 的语义：接近 0.5 表示"不确定"，接近边界（0或1）表示"确定"
         # 这里我们直接用 w 作为权重：w 大 → 更重视该位置的重建
         # 边界惩罚会自然地让 w 在 (0,1) 内分布，模型学习哪些位置需要更多关注
-        recon_loss = recon_criterion(y_hat, x_clean, weight=w)
+        # 强制 w 最小为 0.05，防止模型通过降低 w 来逃避重建任务（置信度坍缩）
+        w_clamped = torch.clamp(w, min=0.05)
+        recon_loss = recon_criterion(y_hat, x_clean, weight=w_clamped)
     else:
         recon_loss = recon_criterion(y_hat, x_clean, weight=None)
     
