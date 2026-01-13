@@ -251,8 +251,18 @@ class HuberLoss(nn.Module):
 
 class ConfidenceRegularization(nn.Module):
     """
-    置信图 w 的正则化
-    包含:
+    置信图 w 的正则化（已弃用，存在方法论缺陷）
+    
+    已知问题：
+        - TV Loss 鼓励平滑 → w 坍缩成常数
+        - Boundary Penalty 是全局标量，无空间依赖
+        - 加权重建鼓励 w → min
+    
+    当前状态：
+        - 此模块仍计算正则项（用于监控），但不影响重建损失
+        - 建议未来移除或重构
+    
+    遗留功能:
         - TV (Total Variation) 平滑正则
         - 边界惩罚（惩罚 w 太接近 0 或 1，鼓励在中间范围）
     """
@@ -301,6 +311,81 @@ class ConfidenceRegularization(nn.Module):
         
         total_reg = self.tv_weight * tv + self.boundary_weight * boundary_pen
         return total_reg, tv, boundary_pen
+
+
+class ImprovedConfidenceRegularization(nn.Module):
+    """
+    改进的置信度正则化（实验性，未启用）
+    
+    核心改进：
+        1. 熵正则化：鼓励 w 在每个样本内有足够的分布熵（防止坍缩成常数）
+        2. 稀疏性约束：鼓励部分位置的 w 接近边界（高置信度），而非全部居中
+        3. 移除 TV Loss（与置信度语义冲突）
+    
+    使用方法：
+        在 cfg 中设置 "use_improved_conf_reg": True
+    """
+    def __init__(self, entropy_weight: float = 0.1, sparsity_weight: float = 0.05):
+        super().__init__()
+        self.entropy_weight = entropy_weight
+        self.sparsity_weight = sparsity_weight
+    
+    def entropy_regularization(self, w: torch.Tensor) -> torch.Tensor:
+        """
+        熵正则化：鼓励 w 在每个样本内有足够的变化
+        
+        Args:
+            w: (B, 1, L)
+        
+        Returns:
+            entropy_loss: 负熵（越大越好，所以返回负值用于最小化）
+        """
+        eps = 1e-6
+        w_clamp = torch.clamp(w, eps, 1 - eps)
+        
+        # 计算每个样本的熵（沿 L 维度）
+        # H = -sum(w * log(w) + (1-w) * log(1-w))
+        entropy = -(w_clamp * torch.log(w_clamp) + (1 - w_clamp) * torch.log(1 - w_clamp))
+        
+        # 返回负熵（鼓励高熵 = 多样性）
+        # 目标：让 w 在空间上有差异，而非常数
+        return -entropy.mean()
+    
+    def sparsity_regularization(self, w: torch.Tensor) -> torch.Tensor:
+        """
+        稀疏性约束：鼓励 w 呈双峰分布（接近 0 或 1），而非都在中间
+        
+        使用 L1 范数的变体：min |w - 0.5|（鼓励远离 0.5）
+        
+        Args:
+            w: (B, 1, L)
+        
+        Returns:
+            sparsity_loss: 鼓励 w 极化（接近边界）
+        """
+        # 惩罚 w 接近 0.5（不确定区域）
+        # 鼓励 w 接近 0 或 1（高置信度区域）
+        return -torch.abs(w - 0.5).mean()  # 负号：最小化此项 = 最大化 |w-0.5|
+    
+    def forward(self, w: torch.Tensor) -> tuple:
+        """
+        Args:
+            w: (B, 1, L)
+        
+        Returns:
+            total_reg: scalar
+            entropy_loss: scalar
+            sparsity_loss: scalar
+        """
+        entropy_loss = self.entropy_regularization(w)
+        sparsity_loss = self.sparsity_regularization(w)
+        
+        total_reg = (
+            self.entropy_weight * entropy_loss +
+            self.sparsity_weight * sparsity_loss
+        )
+        
+        return total_reg, entropy_loss, sparsity_loss
 
 
 # ================================
@@ -378,21 +463,23 @@ def compute_losses(
     # 1) 时域重建损失
     recon_criterion = CharbonnierLoss(eps=cfg.get("charbonnier_eps", 1e-6))
     
-    # Warm-up期间禁用weighted_recon，避免w接近0导致loss消失
-    current_epoch = cfg.get("_current_epoch", 0)
-    warmup_epochs = cfg.get("conf_warmup_epochs", 0)
-    use_weighted = cfg.get("use_weighted_recon", False) and (current_epoch >= warmup_epochs)
+    # ========================================
+    # 置信度策略状态：已禁用（方法论缺陷）
+    # ========================================
+    # 问题分析：
+    # 1. TV Loss 鼓励 w 平滑 → 极端解：w 变成常数（w_std → 0）
+    # 2. Boundary Penalty 是全局标量，无法鼓励空间差异
+    # 3. 加权重建鼓励 w → min，导致 w 坍缩到下界
+    # 结果：w 失去空间自适应能力，等价于一个无用的全局标量
+    # ========================================
+    # 修复方案：
+    # - 当前：完全禁用加权机制，使用标准重建损失
+    # - 未来：若需要自适应加权，需重新设计策略（如熵正则化、稀疏性约束等）
+    # ========================================
     
-    if use_weighted:
-        # 使用置信图加权
-        # w 的语义：接近 0.5 表示"不确定"，接近边界（0或1）表示"确定"
-        # 这里我们直接用 w 作为权重：w 大 → 更重视该位置的重建
-        # 边界惩罚会自然地让 w 在 (0,1) 内分布，模型学习哪些位置需要更多关注
-        # 强制 w 最小为 0.05，防止模型通过降低 w 来逃避重建任务（置信度坍缩）
-        w_clamped = torch.clamp(w, min=0.2)
-        recon_loss = recon_criterion(y_hat, x_clean, weight=w_clamped)
-    else:
-        recon_loss = recon_criterion(y_hat, x_clean, weight=None)
+    # 强制禁用加权重建（即使配置文件中启用）
+    use_weighted = False
+    recon_loss = recon_criterion(y_hat, x_clean, weight=None)
     
     # 1.5) 频域重建损失（可选）
     freq_loss = torch.tensor(0.0, device=y_hat.device)
@@ -444,6 +531,11 @@ def compute_losses(
         "boundary_penalty": boundary_penalty,
         "consistency": consistency_loss,
         "conf_weight": conf_weight,  # 当前权重
+        # 诊断信息：监控 w 的统计特性
+        "w_mean": w.mean().item(),
+        "w_std": w.std().item(),
+        "w_min": w.min().item(),
+        "w_max": w.max().item(),
     }
     
     return losses
