@@ -16,6 +16,7 @@
 - [快速开始](#快速开始)
 - [配置说明](#配置说明)
 - [训练与验证](#训练与验证)
+- [推理与部署](#推理与部署)
 - [技术细节](#技术细节)
 - [可复现性](#可复现性)
 
@@ -119,7 +120,8 @@ cDDPM/V5/
 ├── datasets/
 │   ├── __init__.py
 │   ├── eeg_pair_dataset.py    # EEGPairDataset 类
-│   └── build_loaders.py       # 数据加载器构建函数
+│   ├── build_loaders.py       # 数据加载器构建函数
+│   └── transforms.py          # 数据增强变换
 ├── signal_processing/
 │   ├── __init__.py
 │   └── stft_utils.py          # STFTProcessor (固定参数 STFT)
@@ -147,6 +149,12 @@ cDDPM/V5/
 ├── configs/
 │   ├── __init__.py
 │   └── default.py             # 默认配置
+├── inference_file.py          # 🆕 文件级推理脚本
+├── visualize_inference.py     # 🆕 推理结果可视化
+├── test_inference.py          # 🆕 推理功能测试
+├── example_inference_api.py   # 🆕 Python API 使用示例
+├── main.py                    # 训练主入口
+├── INFERENCE_README.md        # 🆕 推理完整文档
 └── README.md                  # 本文档
 ```
 
@@ -577,6 +585,81 @@ model.to(device)
 
 ---
 
+## 推理与部署
+
+### 文件级推理
+
+训练完成后，使用 `inference_file.py` 对新数据进行降噪：
+
+#### 单文件推理
+
+```bash
+python inference_file.py \
+    --checkpoint output_V5/checkpoints/best_model.pth \
+    --input data/noisy_signal.npy \
+    --output results/denoised_signal.npy \
+    --segment_length 2048 \
+    --stride 1024
+```
+
+#### 批量推理（目录）
+
+```bash
+python inference_file.py \
+    --checkpoint output_V5/checkpoints/best_model.pth \
+    --input data/raw_signals/ \
+    --output results/denoised/ \
+    --pattern "*.npy" \
+    --batch_size 32
+```
+
+#### 推理参数说明
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--checkpoint` | - | 模型文件路径（必需）|
+| `--input` | - | 输入文件或目录（必需）|
+| `--output` | - | 输出文件或目录（必需）|
+| `--segment_length` | 2048 | 分割片段长度 |
+| `--stride` | 1024 | 滑窗步长（建议为segment_length/2）|
+| `--normalize` | zscore | 归一化方法（zscore/minmax/none）|
+| `--batch_size` | 32 | 批处理大小 |
+| `--save_format` | npy | 保存格式（npy/npz/txt）|
+| `--device` | cuda | 设备（cuda/cpu）|
+
+**长信号处理**：自动使用滑窗分割 → 批量推理 → 重叠平均重建，保持信号完整性。
+
+### 结果可视化
+
+使用 `visualize_inference.py` 比较原始和降噪信号：
+
+```bash
+python visualize_inference.py \
+    --raw data/test_001_raw.npy \
+    --denoised results/test_001_denoised.npy \
+    --clean data/test_001_clean.npy \
+    --spectral \
+    --save comparison.png
+```
+
+### 快速测试
+
+运行测试脚本验证推理功能：
+
+```bash
+python test_inference.py
+```
+
+该脚本会：
+1. 检查模型和数据文件
+2. 执行单文件推理测试
+3. 执行批量推理测试
+4. 验证输出文件并显示统计信息
+
+**详细文档**: 查看 [`INFERENCE_README.md`](INFERENCE_README.md) 获取完整推理指南。
+
+---
+
 ## 常见问题
 
 ### Q1: STFT 频率 bin 不匹配？
@@ -602,6 +685,13 @@ model.to(device)
 1. 数据集是否正确配对（raw/clean 文件名一致）
 2. 归一化是否合理（建议使用 `zscore_per_sample`）
 3. 学习率是否过大（降低到 `1e-5` 试试）
+
+### Q5: 推理时显存不足？
+
+**A**: 减小推理批处理大小或分割长度：
+```bash
+--batch_size 8 --segment_length 1024
+```
 
 ---
 
