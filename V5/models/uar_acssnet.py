@@ -1,6 +1,11 @@
 """
 UAR-ACSSNet: Unified Artifact Removal with Axis-Conditioned Selective Scan Network
 单通道 EEG 去伪影端到端模型
+
+v2.0: 使用双向 Mamba (Bidirectional State Space Model) 替换 DepthwiseScan1D
+      - 实现真正的 Selective State Space Model (S6)
+      - 双向扫描融合 (forward + backward)
+      - 数值稳定的状态空间参数化
 """
 import torch
 import torch.nn as nn
@@ -9,6 +14,7 @@ from typing import Tuple, Optional, Dict
 import math
 import sys
 from pathlib import Path
+from einops import rearrange, repeat
 
 # 确保可以导入 signal_processing
 _parent_dir = Path(__file__).parent.parent
@@ -16,6 +22,370 @@ if str(_parent_dir) not in sys.path:
     sys.path.insert(0, str(_parent_dir))
 
 from signal_processing import STFTProcessor
+
+
+# ================================
+# 0) Mamba 核心实现
+# ================================
+
+class SelectiveSSM(nn.Module):
+    """
+    Selective State Space Model (S6) - Mamba 的核心
+    
+    实现选择性扫描机制:
+        x_k = A_k * x_{k-1} + B_k * u_k
+        y_k = C_k * x_k + D * u_k
+    
+    其中 A, B, C 是输入依赖的（选择性）
+    
+    数值稳定策略:
+        1. A 使用负指数参数化: A = -exp(log_A) 确保离散化后稳定
+        2. Delta (时间步长) 使用 softplus 确保正值
+        3. 归一化状态更新防止梯度爆炸/消失
+    
+    Args:
+        d_model: 输入通道数
+        d_state: 状态空间维度 (N)
+        d_conv: 局部卷积核大小
+        expand: 内部扩展因子
+        dt_min, dt_max: Delta 范围限制
+        dt_init: Delta 初始化策略
+        dt_scale: Delta 缩放因子
+        bias: 是否使用偏置
+        conv_bias: 卷积是否使用偏置
+    """
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        dt_min: float = 0.001,
+        dt_max: float = 0.1,
+        dt_init: str = "random",
+        dt_scale: float = 1.0,
+        bias: bool = False,
+        conv_bias: bool = True,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.expand = expand
+        self.d_inner = int(expand * d_model)
+        
+        self.dt_min = dt_min
+        self.dt_max = dt_max
+        
+        # 输入投影: x -> (z, x_proj) 其中 z 用于门控
+        self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=bias)
+        
+        # 局部卷积（短程依赖捕获）
+        self.conv1d = nn.Conv1d(
+            in_channels=self.d_inner,
+            out_channels=self.d_inner,
+            kernel_size=d_conv,
+            padding=d_conv - 1,
+            groups=self.d_inner,
+            bias=conv_bias,
+        )
+        
+        # SSM 参数投影
+        # B, C, Delta 从输入动态生成（选择性机制）
+        self.x_proj = nn.Linear(self.d_inner, d_state * 2 + 1, bias=False)
+        
+        # A 参数（对数空间，确保稳定性）
+        # 初始化为 HiPPO 矩阵的近似
+        A = repeat(
+            torch.arange(1, d_state + 1, dtype=torch.float32),
+            'n -> d n',
+            d=self.d_inner,
+        )
+        self.log_A = nn.Parameter(torch.log(A))
+        
+        # D 参数（直接通路）
+        self.D = nn.Parameter(torch.ones(self.d_inner))
+        
+        # Delta 投影和初始化
+        self.dt_proj = nn.Linear(1, self.d_inner, bias=True)
+        self._init_dt_proj(dt_init, dt_scale)
+        
+        # 输出投影
+        self.out_proj = nn.Linear(self.d_inner, d_model, bias=bias)
+        
+        # LayerNorm for stability
+        self.norm = nn.LayerNorm(self.d_inner)
+    
+    def _init_dt_proj(self, dt_init: str, dt_scale: float):
+        """初始化 Delta 投影层，确保合理的时间步长范围"""
+        dt = torch.exp(
+            torch.rand(self.d_inner) * (math.log(self.dt_max) - math.log(self.dt_min))
+            + math.log(self.dt_min)
+        )
+        # 逆 softplus
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            self.dt_proj.bias.copy_(inv_dt)
+        
+        # 小权重初始化
+        nn.init.normal_(self.dt_proj.weight, std=0.001 * dt_scale)
+    
+    def _ssm_scan(self, u: torch.Tensor, delta: torch.Tensor, 
+                  A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> torch.Tensor:
+        """
+        执行选择性状态空间扫描（序列方向）
+        
+        使用离散化公式:
+            A_bar = exp(delta * A)
+            B_bar = delta * B
+            x_k = A_bar * x_{k-1} + B_bar * u_k
+            y_k = C * x_k
+        
+        Args:
+            u: (B, D, L) 输入序列
+            delta: (B, D, L) 时间步长
+            A: (D, N) 状态转移矩阵（对数空间）
+            B: (B, N, L) 输入矩阵
+            C: (B, N, L) 输出矩阵
+        
+        Returns:
+            y: (B, D, L) 输出序列
+        """
+        B_batch, D, L = u.shape
+        N = A.shape[1]
+        
+        # 离散化 A: A_bar = exp(delta * A)
+        # delta: (B, D, L) -> (B, D, L, 1)
+        # A: (D, N) -> (1, D, 1, N)
+        delta_A = delta.unsqueeze(-1) * (-torch.exp(A)).unsqueeze(0).unsqueeze(2)
+        A_bar = torch.exp(delta_A)  # (B, D, L, N)
+        
+        # 离散化 B: B_bar = delta * B
+        # delta: (B, D, L) -> (B, D, L, 1)
+        # B: (B, N, L) -> (B, 1, L, N)
+        delta_B = delta.unsqueeze(-1) * B.permute(0, 2, 1).unsqueeze(1)  # (B, D, L, N)
+        
+        # 初始化状态
+        x = torch.zeros(B_batch, D, N, device=u.device, dtype=u.dtype)
+        
+        # 输出容器
+        ys = []
+        
+        # 序列扫描
+        for t in range(L):
+            # x_k = A_bar * x_{k-1} + B_bar * u_k
+            x = A_bar[:, :, t, :] * x + delta_B[:, :, t, :] * u[:, :, t:t+1]
+            # y_k = C * x_k
+            # C[:, :, t]: (B, N) -> (B, 1, N)
+            # x: (B, D, N)
+            y_t = torch.einsum('bn,bdn->bd', C[:, :, t], x)
+            ys.append(y_t)
+        
+        y = torch.stack(ys, dim=-1)  # (B, D, L)
+        return y
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, L, D) 输入序列
+        
+        Returns:
+            y: (B, L, D) 输出序列
+        """
+        B, L, D = x.shape
+        
+        # 输入投影和分割
+        xz = self.in_proj(x)  # (B, L, 2*d_inner)
+        x_proj, z = xz.chunk(2, dim=-1)  # 各 (B, L, d_inner)
+        
+        # 局部卷积
+        x_conv = rearrange(x_proj, 'b l d -> b d l')
+        x_conv = self.conv1d(x_conv)[:, :, :L]  # 裁剪到原始长度
+        x_conv = rearrange(x_conv, 'b d l -> b l d')
+        x_conv = F.silu(x_conv)
+        
+        # SSM 参数投影
+        ssm_params = self.x_proj(x_conv)  # (B, L, 2N+1)
+        B_proj, C_proj, delta_raw = torch.split(
+            ssm_params, [self.d_state, self.d_state, 1], dim=-1
+        )
+        
+        # Delta: softplus 确保正值，并限制范围
+        delta = F.softplus(self.dt_proj(delta_raw))  # (B, L, d_inner)
+        delta = torch.clamp(delta, min=self.dt_min, max=self.dt_max)
+        delta = rearrange(delta, 'b l d -> b d l')
+        
+        # 重排列用于 SSM
+        u = rearrange(x_conv, 'b l d -> b d l')
+        B_proj = rearrange(B_proj, 'b l n -> b n l')
+        C_proj = rearrange(C_proj, 'b l n -> b n l')
+        
+        # SSM 扫描
+        y_ssm = self._ssm_scan(u, delta, self.log_A, B_proj, C_proj)
+        
+        # 直接通路
+        y_ssm = y_ssm + u * self.D.unsqueeze(0).unsqueeze(-1)
+        
+        # 重排回 (B, L, D)
+        y_ssm = rearrange(y_ssm, 'b d l -> b l d')
+        y_ssm = self.norm(y_ssm)
+        
+        # 门控输出
+        y = y_ssm * F.silu(z)
+        
+        # 输出投影
+        y = self.out_proj(y)
+        
+        return y
+
+
+class BidirectionalMamba(nn.Module):
+    """
+    双向 Mamba 模块
+    
+    结合正向和反向的选择性状态空间扫描，
+    捕获序列的双向长程依赖。
+    
+    融合策略:
+        1. 分别执行前向和后向 SSM
+        2. 后向输出翻转对齐
+        3. 使用可学习权重融合或简单相加
+    
+    数值稳定策略:
+        1. 前后向分别归一化
+        2. 融合后再次归一化
+        3. 残差连接
+    
+    Args:
+        d_model: 模型维度
+        d_state: 状态空间维度
+        d_conv: 局部卷积核大小
+        expand: 扩展因子
+        fusion: 融合方式 ('add', 'concat', 'gate')
+        dropout: dropout 比例
+    """
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        fusion: str = 'gate',
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.fusion = fusion
+        
+        # 前向 SSM
+        self.ssm_forward = SelectiveSSM(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+        )
+        
+        # 后向 SSM
+        self.ssm_backward = SelectiveSSM(
+            d_model=d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+        )
+        
+        # 融合层
+        if fusion == 'concat':
+            self.fusion_proj = nn.Linear(d_model * 2, d_model)
+        elif fusion == 'gate':
+            self.fusion_gate = nn.Sequential(
+                nn.Linear(d_model * 2, d_model),
+                nn.Sigmoid(),
+            )
+        
+        # 归一化和 dropout
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        
+        self._sanity_checked = False
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, L, D) 输入序列
+        
+        Returns:
+            y: (B, L, D) 输出序列
+        """
+        identity = x
+        
+        # 前向扫描
+        y_fwd = self.ssm_forward(x)
+        
+        # 后向扫描（翻转 -> SSM -> 翻转回来）
+        x_rev = torch.flip(x, dims=[1])
+        y_bwd_rev = self.ssm_backward(x_rev)
+        y_bwd = torch.flip(y_bwd_rev, dims=[1])
+        
+        # 融合
+        if self.fusion == 'add':
+            y = (y_fwd + y_bwd) / 2
+        elif self.fusion == 'concat':
+            y = self.fusion_proj(torch.cat([y_fwd, y_bwd], dim=-1))
+        elif self.fusion == 'gate':
+            gate = self.fusion_gate(torch.cat([y_fwd, y_bwd], dim=-1))
+            y = gate * y_fwd + (1 - gate) * y_bwd
+        else:
+            y = y_fwd + y_bwd
+        
+        # 残差 + 归一化
+        y = self.dropout(y)
+        y = self.norm(y + identity)
+        
+        # Sanity check (首次)
+        if not self._sanity_checked and self.training:
+            self._sanity_check(x, y_fwd, y_bwd)
+            self._sanity_checked = True
+        
+        return y
+    
+    def _sanity_check(self, x, y_fwd, y_bwd):
+        """验证双向扫描的有效性"""
+        with torch.no_grad():
+            # 检查前向和后向输出的相关性（应该不同但相关）
+            fwd_flat = y_fwd.view(-1)
+            bwd_flat = y_bwd.view(-1)
+            
+            if fwd_flat.std() > 1e-6 and bwd_flat.std() > 1e-6:
+                corr = torch.corrcoef(torch.stack([fwd_flat, bwd_flat]))[0, 1]
+                print(f"    [BiMamba] Forward-Backward correlation: {corr.item():.4f}")
+                
+                # 检查输出统计
+                print(f"    [BiMamba] y_fwd: mean={y_fwd.mean():.4f}, std={y_fwd.std():.4f}")
+                print(f"    [BiMamba] y_bwd: mean={y_bwd.mean():.4f}, std={y_bwd.std():.4f}")
+
+
+class DepthwiseScan1D(nn.Module):
+    """
+    [Legacy] 简化的扫描模拟（使用 depthwise Conv1D + dilation）
+    保留用于向后兼容，新代码请使用 BidirectionalMamba
+    """
+    def __init__(self, channels: int, kernel_size: int = 7, dilation: int = 1):
+        super().__init__()
+        padding = (kernel_size - 1) * dilation // 2
+        self.conv = nn.Conv1d(
+            channels, channels,
+            kernel_size=kernel_size,
+            padding=padding,
+            dilation=dilation,
+            groups=channels,  # depthwise
+        )
+        self.norm = nn.GroupNorm(min(8, channels), channels)
+    
+    def forward(self, x):
+        # x: (B, C, L)
+        out = self.conv(x)
+        out = self.norm(out)
+        return F.gelu(out)
 
 
 # ================================
@@ -210,22 +580,47 @@ class DepthwiseScan1D(nn.Module):
 
 
 class ScanFreq(nn.Module):
-    """沿频率轴的扫描聚合（针对 (B,C,T,F) 输入）"""
-    def __init__(self, channels: int):
+    """
+    沿频率轴的双向 Mamba 扫描（针对 (B,C,T,F) 输入）
+    
+    使用 BidirectionalMamba 替代 DepthwiseScan1D，
+    实现真正的选择性状态空间扫描。
+    
+    维度重组策略:
+        输入: (B, C, T, F)
+        重组: (B*T, F, C) - 将 T 维度合并到 batch，沿 F 方向扫描
+        扫描: BidirectionalMamba 处理
+        还原: (B, C, T, F)
+    """
+    def __init__(self, channels: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
         super().__init__()
-        # 对每个 (t) 位置，沿 f 维度扫描
-        # 实现：permute 到 (B,C,F,T) 后做 depthwise conv
-        # 增大 kernel_size 到 31 以捕捉频域长程依赖 (101 bins)
-        self.scan = DepthwiseScan1D(channels, kernel_size=31)
+        # 双向 Mamba 用于频率轴扫描
+        # 使用 gate 融合策略，动态平衡低频和高频信息
+        self.scan = BidirectionalMamba(
+            d_model=channels,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+            fusion='gate',
+            dropout=0.0,
+        )
         self._sanity_checked = False
     
     def forward(self, x):
         # x: (B, C, T, F)
         B, C, T, F = x.shape
-        # (B, C, T, F) -> (B*T, C, F)
-        x_reshaped = x.permute(0, 2, 1, 3).reshape(B*T, C, F)
-        out = self.scan(x_reshaped)  # (B*T, C, F)
-        out = out.reshape(B, T, C, F).permute(0, 2, 1, 3)  # -> (B, C, T, F)
+        
+        # 维度重组: (B, C, T, F) -> (B*T, F, C)
+        # 将每个时间帧视为独立样本，沿频率轴扫描
+        x_reshaped = x.permute(0, 2, 3, 1)  # (B, T, F, C)
+        x_reshaped = x_reshaped.reshape(B * T, F, C)  # (B*T, F, C)
+        
+        # 双向 Mamba 扫描
+        out = self.scan(x_reshaped)  # (B*T, F, C)
+        
+        # 还原维度: (B*T, F, C) -> (B, C, T, F)
+        out = out.reshape(B, T, F, C)  # (B, T, F, C)
+        out = out.permute(0, 3, 1, 2)  # (B, C, T, F)
         
         # Sanity check: 脉冲输入测试（仅首次）
         if not self._sanity_checked and self.training:
@@ -239,38 +634,67 @@ class ScanFreq(nn.Module):
         with torch.no_grad():
             B, C, T, F = x.shape
             # 创建脉冲：在中心频率处设置脉冲
-            pulse = torch.zeros(1, C, 1, F, device=x.device)
+            pulse = torch.zeros(1, C, 1, F, device=x.device, dtype=x.dtype)
             pulse[:, :, :, F//2] = 1.0
             
-            # 前向传播
-            pulse_reshaped = pulse.permute(0, 2, 1, 3).reshape(1, C, F)
+            # 维度重组
+            pulse_reshaped = pulse.permute(0, 2, 3, 1).reshape(1, F, C)
             out = self.scan(pulse_reshaped)
-            out_reshaped = out.reshape(1, 1, C, F).permute(0, 2, 1, 3).squeeze(2)  # (1, C, F)
+            out_reshaped = out.reshape(1, 1, F, C).permute(0, 3, 1, 2).squeeze(2)  # (1, C, F)
             
-            # 检查扩散
-            nonzero_indices = (out_reshaped[0, 0, :] > 1e-3).nonzero(as_tuple=True)[0]
+            # 检查扩散（Mamba 应该产生更广泛的扩散）
+            energy = out_reshaped[0, 0, :].abs()
+            threshold = energy.max() * 0.01
+            nonzero_indices = (energy > threshold).nonzero(as_tuple=True)[0]
             if len(nonzero_indices) > 1:
                 spread = nonzero_indices.max() - nonzero_indices.min() + 1
-                print(f"    [ScanFreq] Pulse spread along F axis: {spread.item()} bins (kernel effective)")
+                print(f"    [ScanFreq/Mamba] Pulse spread along F axis: {spread.item()} bins")
             else:
-                print(f"    [ScanFreq] No spreading detected (identity-like)")
+                print(f"    [ScanFreq/Mamba] No spreading detected")
 
 
 class ScanTime(nn.Module):
-    """沿时间轴的扫描聚合（针对 (B,C,T,F) 输入）"""
-    def __init__(self, channels: int):
+    """
+    沿时间轴的双向 Mamba 扫描（针对 (B,C,T,F) 输入）
+    
+    使用 BidirectionalMamba 替代 DepthwiseScan1D，
+    实现真正的选择性状态空间扫描。
+    
+    维度重组策略:
+        输入: (B, C, T, F)
+        重组: (B*F, T, C) - 将 F 维度合并到 batch，沿 T 方向扫描
+        扫描: BidirectionalMamba 处理
+        还原: (B, C, T, F)
+    """
+    def __init__(self, channels: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
         super().__init__()
-        # 对每个 (f) 位置，沿 t 维度扫描
-        self.scan = DepthwiseScan1D(channels, kernel_size=5)
+        # 双向 Mamba 用于时间轴扫描
+        # 使用 gate 融合策略，动态平衡过去和未来信息
+        self.scan = BidirectionalMamba(
+            d_model=channels,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+            fusion='gate',
+            dropout=0.0,
+        )
         self._sanity_checked = False
     
     def forward(self, x):
         # x: (B, C, T, F)
         B, C, T, F = x.shape
-        # (B, C, T, F) -> (B*F, C, T)
-        x_reshaped = x.permute(0, 3, 1, 2).reshape(B*F, C, T)
-        out = self.scan(x_reshaped)  # (B*F, C, T)
-        out = out.reshape(B, F, C, T).permute(0, 2, 3, 1)  # -> (B, C, T, F)
+        
+        # 维度重组: (B, C, T, F) -> (B*F, T, C)
+        # 将每个频率 bin 视为独立样本，沿时间轴扫描
+        x_reshaped = x.permute(0, 3, 2, 1)  # (B, F, T, C)
+        x_reshaped = x_reshaped.reshape(B * F, T, C)  # (B*F, T, C)
+        
+        # 双向 Mamba 扫描
+        out = self.scan(x_reshaped)  # (B*F, T, C)
+        
+        # 还原维度: (B*F, T, C) -> (B, C, T, F)
+        out = out.reshape(B, F, T, C)  # (B, F, T, C)
+        out = out.permute(0, 3, 2, 1)  # (B, C, T, F)
         
         # Sanity check: 脉冲输入测试（仅首次）
         if not self._sanity_checked and self.training:
@@ -284,40 +708,55 @@ class ScanTime(nn.Module):
         with torch.no_grad():
             B, C, T, F = x.shape
             # 创建脉冲：在中心时间处设置脉冲
-            pulse = torch.zeros(1, C, T, 1, device=x.device)
+            pulse = torch.zeros(1, C, T, 1, device=x.device, dtype=x.dtype)
             pulse[:, :, T//2, :] = 1.0
             
-            # 前向传播
-            pulse_reshaped = pulse.permute(0, 3, 1, 2).reshape(1, C, T)
+            # 维度重组
+            pulse_reshaped = pulse.permute(0, 3, 2, 1).reshape(1, T, C)
             out = self.scan(pulse_reshaped)
-            out_reshaped = out.reshape(1, 1, C, T).permute(0, 2, 3, 1).squeeze(3)  # (1, C, T)
+            out_reshaped = out.reshape(1, 1, T, C).permute(0, 3, 2, 1).squeeze(3)  # (1, C, T)
             
-            # 检查扩散
-            nonzero_indices = (out_reshaped[0, 0, :] > 1e-3).nonzero(as_tuple=True)[0]
+            # 检查扩散（Mamba 应该产生更广泛的扩散）
+            energy = out_reshaped[0, 0, :].abs()
+            threshold = energy.max() * 0.01
+            nonzero_indices = (energy > threshold).nonzero(as_tuple=True)[0]
             if len(nonzero_indices) > 1:
                 spread = nonzero_indices.max() - nonzero_indices.min() + 1
-                print(f"    [ScanTime] Pulse spread along T axis: {spread.item()} frames (kernel effective)")
+                print(f"    [ScanTime/Mamba] Pulse spread along T axis: {spread.item()} frames")
             else:
-                print(f"    [ScanTime] No spreading detected (identity-like)")
+                print(f"    [ScanTime/Mamba] No spreading detected")
 
 
 # ================================
-# 4) ACSSBlock2D（核心模块）
+# 4) ACSSBlock2D（核心模块 - Mamba 版本）
 # ================================
 
 class ACSSBlock2D(nn.Module):
     """
-    Axis-Conditioned Selective Scan Block (2D)
+    Axis-Conditioned Selective Scan Block (2D) - Mamba 版本
     
     输入输出: (B, C, T, F)
     
     包含:
         1) Axis Summary: 提取频轴和时轴摘要
         2) Axis-conditioned Gate: 生成位置相关门控
-        3) Selective Scan Mixture: 扫描聚合并混合
+        3) Bidirectional Mamba Scan: 双向状态空间扫描并混合
         4) Residual + Norm
+    
+    状态空间参数策略:
+        - d_state=16: 足够的状态维度捕捉 EEG 的复杂模式
+        - d_conv=4: 局部卷积核，捕捉短程依赖
+        - expand=2: 适度扩展以增加表达能力
+        - gate fusion: 动态平衡前向和后向信息
     """
-    def __init__(self, channels: int, dropout: float = 0.0):
+    def __init__(
+        self, 
+        channels: int, 
+        dropout: float = 0.0,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+    ):
         super().__init__()
         self.channels = channels
         
@@ -335,9 +774,9 @@ class ACSSBlock2D(nn.Module):
             nn.Sigmoid(),
         )
         
-        # 3) Selective Scan（可替代接口）
-        self.scan_freq = ScanFreq(channels)
-        self.scan_time = ScanTime(channels)
+        # 3) Bidirectional Mamba Scan（替代 DepthwiseScan1D）
+        self.scan_freq = ScanFreq(channels, d_state=d_state, d_conv=d_conv, expand=expand)
+        self.scan_time = ScanTime(channels, d_state=d_state, d_conv=d_conv, expand=expand)
         
         # 4) 输出投影
         self.proj = nn.Conv2d(channels, channels, kernel_size=1)
@@ -372,7 +811,7 @@ class ACSSBlock2D(nn.Module):
         # 2) Gate（基于频轴摘要）
         g_freq = self.gate_net(s_f)  # (B, 1, T)
         
-        # 3) Selective Scan
+        # 3) Bidirectional Mamba Selective Scan
         U_freq = self.scan_freq(x)  # (B, C, T, F)
         U_time = self.scan_time(x)  # (B, C, T, F)
         
@@ -521,9 +960,11 @@ class UAR_ACSSNet(nn.Module):
     """
     Unified Artifact Removal with Axis-Conditioned Selective Scan Network
     
+    v2.0: 使用双向 Mamba 替代 DepthwiseScan1D
+    
     完整端到端模型，包含:
         - 时域主干: 1D U-Net
-        - 时频分支: SpecEncoder2D + ACSSStack2D
+        - 时频分支: SpecEncoder2D + ACSSStack2D (Bidirectional Mamba)
         - 跨域融合: FiLM 调制
         - 置信图生成
     
@@ -535,6 +976,10 @@ class UAR_ACSSNet(nn.Module):
         acss_depth: ACSSBlock 堆叠层数
         num_freq_bins: STFT 选定的频率 bin 数量（需与 STFTProcessor 一致）
         dropout: dropout 比例
+        baseline_mode: 仅使用U-Net，不使用时频分支
+        mamba_d_state: Mamba 状态空间维度（N）
+        mamba_d_conv: Mamba 局部卷积核大小
+        mamba_expand: Mamba 内部扩展因子
     """
     def __init__(
         self,
@@ -546,11 +991,20 @@ class UAR_ACSSNet(nn.Module):
         num_freq_bins: int = 103,  # 1-100 Hz @ 500Hz, n_fft=512 -> 103 bins
         dropout: float = 0.0,
         baseline_mode: bool = False,  # 仅使用U-Net，不使用时频分支
+        # Mamba 状态空间参数
+        mamba_d_state: int = 16,     # 状态维度，控制记忆容量
+        mamba_d_conv: int = 4,       # 局部卷积核，捕捉短程依赖
+        mamba_expand: int = 2,       # 扩展因子，增加表达能力
     ):
         super().__init__()
         self.segment_length = segment_length
         self.num_freq_bins = num_freq_bins
         self.baseline_mode = baseline_mode
+        
+        # 保存 Mamba 参数
+        self.mamba_d_state = mamba_d_state
+        self.mamba_d_conv = mamba_d_conv
+        self.mamba_expand = mamba_expand
         
         # STFT 处理器（固定参数）
         self.stft_proc = STFTProcessor(
@@ -579,9 +1033,15 @@ class UAR_ACSSNet(nn.Module):
                 dropout=dropout,
             )
             
-            # ACSSBlock 堆叠
+            # ACSSBlock 堆叠（使用 Bidirectional Mamba）
             self.acss_blocks = nn.ModuleList([
-                ACSSBlock2D(spec_channels, dropout) for _ in range(acss_depth)
+                ACSSBlock2D(
+                    channels=spec_channels, 
+                    dropout=dropout,
+                    d_state=mamba_d_state,
+                    d_conv=mamba_d_conv,
+                    expand=mamba_expand,
+                ) for _ in range(acss_depth)
             ])
             
             # 跨域融合: FiLM Generator
@@ -742,10 +1202,19 @@ class UAR_ACSSNet(nn.Module):
 
 
 def test_model():
-    """测试模型前向传播"""
-    print("\n=== Testing UAR-ACSSNet ===\n")
+    """测试模型前向传播（Mamba 版本）"""
+    print("\n=== Testing UAR-ACSSNet v2.0 (Bidirectional Mamba) ===\n")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    # 测试配置
+    print("\n[1] Model Configuration:")
+    print(f"    - Bidirectional Mamba SSM")
+    print(f"    - d_state=16 (state dimension)")
+    print(f"    - d_conv=4 (local convolution)")
+    print(f"    - expand=2 (expansion factor)")
+    print(f"    - fusion='gate' (learnable gating)")
     
     model = UAR_ACSSNet(
         segment_length=2048,
@@ -755,19 +1224,40 @@ def test_model():
         acss_depth=3,
         num_freq_bins=103,
         dropout=0.1,
+        # Mamba 参数
+        mamba_d_state=16,
+        mamba_d_conv=4,
+        mamba_expand=2,
     ).to(device)
     
     # 统计参数量
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total params: {total_params:,}")
-    print(f"Trainable params: {trainable_params:,}\n")
+    print(f"\n[2] Model Parameters:")
+    print(f"    Total params: {total_params:,}")
+    print(f"    Trainable params: {trainable_params:,}")
+    
+    # 统计各模块参数
+    unet_params = sum(p.numel() for p in model.unet.parameters())
+    if hasattr(model, 'acss_blocks'):
+        acss_params = sum(p.numel() for p in model.acss_blocks.parameters())
+        spec_params = sum(p.numel() for p in model.spec_encoder.parameters())
+        print(f"    U-Net: {unet_params:,}")
+        print(f"    SpecEncoder: {spec_params:,}")
+        print(f"    ACSS (Mamba): {acss_params:,}")
     
     # 前向传播测试
+    print(f"\n[3] Forward Pass Test:")
     x = torch.randn(4, 1, 2048).to(device)
     
-    print(f"\n[Scan Sanity Check - will trigger during first forward]")
+    # 训练模式（触发 sanity check）
+    model.train()
+    print(f"\n[Mamba Sanity Checks - first forward in training mode]")
+    outputs = model(x)
     
+    # 评估模式
+    model.eval()
+    print(f"\n[4] Inference Test:")
     with torch.no_grad():
         outputs = model(x)
     
@@ -777,17 +1267,15 @@ def test_model():
         print(f"  Keys: {list(outputs.keys())}")
         for k, v in outputs.items():
             print(f"  {k}: {v.shape}, range=[{v.min():.3f}, {v.max():.3f}]")
-    else:
-        print(f"  Warning: Expected dict, got {type(outputs)}")
     
     # 验证 shape 和范围
-    assert outputs["y_hat"].shape == (4, 1, 2048)
-    assert outputs["w"].shape == (4, 1, 2048)
-    assert (outputs["w"] >= 0).all() and (outputs["w"] <= 1).all()
+    assert outputs["y_hat"].shape == (4, 1, 2048), "y_hat shape mismatch"
+    assert outputs["w"].shape == (4, 1, 2048), "w shape mismatch"
+    assert (outputs["w"] >= 0).all() and (outputs["w"] <= 1).all(), "w out of range"
     
     # 详细检查 w 的统计特性
     w = outputs["w"]
-    print(f"\n  Confidence Map (w) Statistics:")
+    print(f"\n[5] Confidence Map (w) Statistics:")
     print(f"    min: {w.min():.6f}")
     print(f"    max: {w.max():.6f}")
     print(f"    mean: {w.mean():.6f}")
@@ -801,8 +1289,95 @@ def test_model():
     if w.min() > 0.4 and w.max() < 0.6:
         print(f"    ⚠ w range very narrow (limited dynamics)")
     
-    print("\n✓ All tests passed!\n")
+    # 测试梯度流
+    print(f"\n[6] Gradient Flow Test:")
+    model.train()
+    x.requires_grad = True
+    outputs = model(x)
+    loss = outputs["y_hat"].sum()
+    loss.backward()
+    
+    # 检查梯度
+    grad_norms = {}
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            grad_norms[name] = param.grad.norm().item()
+    
+    max_grad = max(grad_norms.values()) if grad_norms else 0
+    min_grad = min(grad_norms.values()) if grad_norms else 0
+    print(f"    Gradient norm range: [{min_grad:.6f}, {max_grad:.6f}]")
+    
+    # 检查 Mamba 模块的梯度
+    mamba_grads = {k: v for k, v in grad_norms.items() if 'ssm' in k.lower() or 'mamba' in k.lower() or 'scan' in k.lower()}
+    if mamba_grads:
+        print(f"    Mamba-related gradients: {len(mamba_grads)} params")
+        print(f"    Mamba grad range: [{min(mamba_grads.values()):.6f}, {max(mamba_grads.values()):.6f}]")
+    
+    print("\n✓ All tests passed!")
+    print("✓ Bidirectional Mamba integration successful!\n")
+
+
+def test_mamba_components():
+    """单独测试 Mamba 组件"""
+    print("\n=== Testing Mamba Components ===\n")
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # 测试 SelectiveSSM
+    print("[1] Testing SelectiveSSM:")
+    ssm = SelectiveSSM(d_model=64, d_state=16, d_conv=4, expand=2).to(device)
+    x = torch.randn(2, 32, 64).to(device)  # (B, L, D)
+    y = ssm(x)
+    print(f"    Input: {x.shape}")
+    print(f"    Output: {y.shape}")
+    assert y.shape == x.shape, "Shape mismatch in SelectiveSSM"
+    print(f"    ✓ SelectiveSSM passed")
+    
+    # 测试 BidirectionalMamba
+    print("\n[2] Testing BidirectionalMamba:")
+    bimamba = BidirectionalMamba(d_model=64, d_state=16, fusion='gate').to(device)
+    bimamba.train()  # 触发 sanity check
+    y = bimamba(x)
+    print(f"    Input: {x.shape}")
+    print(f"    Output: {y.shape}")
+    assert y.shape == x.shape, "Shape mismatch in BidirectionalMamba"
+    print(f"    ✓ BidirectionalMamba passed")
+    
+    # 测试 ScanFreq
+    print("\n[3] Testing ScanFreq (Mamba):")
+    scan_freq = ScanFreq(channels=64, d_state=16).to(device)
+    x_tf = torch.randn(2, 64, 32, 103).to(device)  # (B, C, T, F)
+    scan_freq.train()
+    y_tf = scan_freq(x_tf)
+    print(f"    Input: {x_tf.shape}")
+    print(f"    Output: {y_tf.shape}")
+    assert y_tf.shape == x_tf.shape, "Shape mismatch in ScanFreq"
+    print(f"    ✓ ScanFreq passed")
+    
+    # 测试 ScanTime
+    print("\n[4] Testing ScanTime (Mamba):")
+    scan_time = ScanTime(channels=64, d_state=16).to(device)
+    scan_time.train()
+    y_tf = scan_time(x_tf)
+    print(f"    Input: {x_tf.shape}")
+    print(f"    Output: {y_tf.shape}")
+    assert y_tf.shape == x_tf.shape, "Shape mismatch in ScanTime"
+    print(f"    ✓ ScanTime passed")
+    
+    # 测试 ACSSBlock2D
+    print("\n[5] Testing ACSSBlock2D (Mamba):")
+    acss = ACSSBlock2D(channels=64, d_state=16, d_conv=4, expand=2).to(device)
+    acss.train()
+    y_tf, g = acss(x_tf)
+    print(f"    Input: {x_tf.shape}")
+    print(f"    Output: {y_tf.shape}")
+    print(f"    Gate: {g.shape}")
+    assert y_tf.shape == x_tf.shape, "Shape mismatch in ACSSBlock2D"
+    print(f"    ✓ ACSSBlock2D passed")
+    
+    print("\n✓ All Mamba component tests passed!\n")
 
 
 if __name__ == "__main__":
+    test_mamba_components()
     test_model()
