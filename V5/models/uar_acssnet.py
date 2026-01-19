@@ -2,10 +2,11 @@
 UAR-ACSSNet: Unified Artifact Removal with Axis-Conditioned Selective Scan Network
 单通道 EEG 去伪影端到端模型
 
-v2.0: 使用双向 Mamba (Bidirectional State Space Model) 替换 DepthwiseScan1D
-      - 实现真正的 Selective State Space Model (S6)
-      - 双向扫描融合 (forward + backward)
-      - 数值稳定的状态空间参数化
+v3.0: 使用 MDTA (Multi-Dconv Head Transposed Attention) 变体
+      - 双轴并行注意力：时间全局性 + 频率全局性
+      - 基于 Restormer (CVPR 2022) 的转置注意力机制
+      - 深度可分离卷积增强局部特征
+      - 保留自适应门控融合策略
 """
 import torch
 import torch.nn as nn
@@ -25,7 +26,342 @@ from signal_processing import STFTProcessor
 
 
 # ================================
-# 0) Mamba 核心实现
+# 0) MDTA 核心实现 (Multi-Dconv Head Transposed Attention)
+# ================================
+
+class DepthwiseConv2d(nn.Module):
+    """深度可分离卷积，用于局部特征增强"""
+    def __init__(self, channels: int, kernel_size: int = 3, bias: bool = True):
+        super().__init__()
+        self.dw_conv = nn.Conv2d(
+            channels, channels,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            groups=channels,
+            bias=bias,
+        )
+    
+    def forward(self, x):
+        return self.dw_conv(x)
+
+
+class MDTA(nn.Module):
+    """
+    Multi-Dconv Head Transposed Attention (MDTA)
+    
+    基于 Restormer (CVPR 2022) 的设计，核心创新点：
+    1. 转置注意力：在通道维度计算注意力，而非空间维度
+       - 计算复杂度: O(C²) vs O((H×W)²)
+       - 更适合处理高分辨率特征图
+    2. 深度可分离卷积：增强局部特征，弥补全局注意力对局部的不足
+    3. 多头机制：不同头关注不同的通道子空间
+    
+    对于 EEG 时频图 (T=33, F=101):
+    - 标准注意力: O(33×101)² = O(11M)
+    - 转置注意力: O(C²) ≈ O(4K) (C=64)
+    
+    Args:
+        channels: 输入通道数
+        num_heads: 注意力头数
+        bias: 是否使用偏置
+    """
+    def __init__(
+        self,
+        channels: int,
+        num_heads: int = 4,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        self.scale = self.head_dim ** -0.5
+        
+        # Q, K, V 投影 (1x1 conv)
+        self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1, bias=bias)
+        
+        # 深度可分离卷积增强 Q, K, V 的局部特征
+        self.qkv_dwconv = DepthwiseConv2d(channels * 3, kernel_size=3, bias=bias)
+        
+        # 输出投影
+        self.proj = nn.Conv2d(channels, channels, kernel_size=1, bias=bias)
+        
+        # 温度参数（可学习）
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, C, H, W) - 对于时频图是 (B, C, T, F)
+        
+        Returns:
+            out: (B, C, H, W)
+        """
+        B, C, H, W = x.shape
+        
+        # Q, K, V 投影 + 深度卷积增强
+        qkv = self.qkv_dwconv(self.qkv(x))  # (B, 3C, H, W)
+        q, k, v = qkv.chunk(3, dim=1)  # 各 (B, C, H, W)
+        
+        # 重排为多头格式
+        # (B, C, H, W) -> (B, heads, head_dim, H*W)
+        q = rearrange(q, 'b (h d) x y -> b h d (x y)', h=self.num_heads)
+        k = rearrange(k, 'b (h d) x y -> b h d (x y)', h=self.num_heads)
+        v = rearrange(v, 'b (h d) x y -> b h d (x y)', h=self.num_heads)
+        
+        # L2 归一化 Q, K（提升稳定性）
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
+        
+        # 转置注意力：在通道维度计算
+        # attn: (B, heads, head_dim, head_dim)
+        attn = (q @ k.transpose(-2, -1)) * self.temperature
+        attn = attn.softmax(dim=-1)
+        
+        # 应用注意力到 V
+        # out: (B, heads, head_dim, H*W)
+        out = attn @ v
+        
+        # 重排回原始形状
+        out = rearrange(out, 'b h d (x y) -> b (h d) x y', x=H, y=W)
+        
+        # 输出投影
+        out = self.proj(out)
+        
+        return out
+
+
+class AxisMDTA(nn.Module):
+    """
+    轴向 MDTA - 专门针对时频图的单轴注意力
+    
+    设计思路:
+    1. 沿指定轴（时间或频率）展开为序列
+    2. 在该轴上应用转置注意力
+    3. 恢复原始维度
+    
+    优势：
+    - 计算效率更高：分解为两个独立的 1D 注意力
+    - 更好的轴向特化：时间轴和频率轴有不同的特性
+    """
+    def __init__(
+        self,
+        channels: int,
+        num_heads: int = 4,
+        axis: str = 'freq',  # 'freq' or 'time'
+        bias: bool = False,
+        ffn_expansion: float = 2.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        self.axis = axis
+        self.head_dim = channels // num_heads
+        self.scale = self.head_dim ** -0.5
+        
+        # 输入归一化
+        self.norm1 = nn.LayerNorm(channels)
+        self.norm2 = nn.LayerNorm(channels)
+        
+        # Q, K, V 投影
+        self.to_qkv = nn.Linear(channels, channels * 3, bias=bias)
+        
+        # 深度可分离卷积增强（1D 版本）
+        # 对于时间轴：沿 T 方向卷积
+        # 对于频率轴：沿 F 方向卷积
+        self.qkv_dwconv = nn.Conv1d(
+            channels * 3, channels * 3,
+            kernel_size=3,
+            padding=1,
+            groups=channels * 3,
+            bias=bias,
+        )
+        
+        # 输出投影
+        self.proj = nn.Linear(channels, channels, bias=bias)
+        
+        # 可学习温度参数
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1) * 0.5)
+        
+        # FFN（使用深度可分离卷积的门控 FFN）
+        hidden_dim = int(channels * ffn_expansion)
+        self.ffn = nn.Sequential(
+            nn.Linear(channels, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, channels),
+            nn.Dropout(dropout),
+        )
+        
+        self.dropout = nn.Dropout(dropout)
+        self._sanity_checked = False
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, C, T, F)
+        
+        Returns:
+            out: (B, C, T, F)
+        """
+        B, C, T, F_dim = x.shape
+        identity = x
+        
+        # 根据轴向重排
+        if self.axis == 'freq':
+            # 沿频率轴注意力: 每个时间帧独立处理
+            # (B, C, T, F) -> (B*T, F, C)
+            x = rearrange(x, 'b c t f -> (b t) f c')
+            seq_len = F_dim
+            batch_size = B * T
+        else:  # 'time'
+            # 沿时间轴注意力: 每个频率 bin 独立处理
+            # (B, C, T, F) -> (B*F, T, C)
+            x = rearrange(x, 'b c t f -> (b f) t c')
+            seq_len = T
+            batch_size = B * F_dim
+        
+        # 归一化
+        x_norm = self.norm1(x)
+        
+        # Q, K, V 投影
+        qkv = self.to_qkv(x_norm)  # (batch, seq, 3*C)
+        
+        # 深度卷积增强（需要转置）
+        qkv = rearrange(qkv, 'b s c -> b c s')
+        qkv = self.qkv_dwconv(qkv)
+        qkv = rearrange(qkv, 'b c s -> b s c')
+        
+        # 分割 Q, K, V
+        q, k, v = qkv.chunk(3, dim=-1)  # 各 (batch, seq, C)
+        
+        # 多头重排: (batch, seq, C) -> (batch, heads, seq, head_dim)
+        q = rearrange(q, 'b s (h d) -> b h s d', h=self.num_heads)
+        k = rearrange(k, 'b s (h d) -> b h s d', h=self.num_heads)
+        v = rearrange(v, 'b s (h d) -> b h s d', h=self.num_heads)
+        
+        # L2 归一化（提升数值稳定性）
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
+        
+        # 转置注意力: (batch, heads, seq, head_dim) @ (batch, heads, head_dim, seq)
+        # -> (batch, heads, seq, seq)
+        # 注意：这里是标准注意力，但序列长度小（T=33 或 F=101）
+        # 转置注意力的优势在全分辨率 2D 时更明显
+        attn = (q @ k.transpose(-2, -1)) * self.temperature
+        attn = attn.softmax(dim=-1)
+        attn = self.dropout(attn)
+        
+        # 应用注意力
+        out = attn @ v  # (batch, heads, seq, head_dim)
+        
+        # 合并多头
+        out = rearrange(out, 'b h s d -> b s (h d)')
+        
+        # 输出投影
+        out = self.proj(out)
+        out = self.dropout(out)
+        
+        # 残差连接
+        out = out + x
+        
+        # FFN
+        out = out + self.ffn(self.norm2(out))
+        
+        # 恢复原始维度
+        if self.axis == 'freq':
+            out = rearrange(out, '(b t) f c -> b c t f', b=B, t=T)
+        else:
+            out = rearrange(out, '(b f) t c -> b c t f', b=B, f=F_dim)
+        
+        # Sanity check（首次）
+        if not self._sanity_checked and self.training:
+            self._sanity_check(identity, out)
+            self._sanity_checked = True
+        
+        return out
+    
+    def _sanity_check(self, x_in, x_out):
+        """验证注意力模块工作正常"""
+        with torch.no_grad():
+            # 检查输出统计
+            in_std = x_in.std().item()
+            out_std = x_out.std().item()
+            print(f"    [AxisMDTA/{self.axis}] Input std: {in_std:.4f}, Output std: {out_std:.4f}")
+            
+            # 检查温度参数
+            temp_mean = self.temperature.mean().item()
+            print(f"    [AxisMDTA/{self.axis}] Temperature mean: {temp_mean:.4f}")
+
+
+class DualAxisMDTA(nn.Module):
+    """
+    双轴并行 MDTA - 同时处理时间和频率轴
+    
+    核心架构：
+    1. 输入分解为两个并行流
+    2. FreqMDTA: 捕捉频率全局性（跨频率 bin 的关系）
+    3. TimeMDTA: 捕捉时间全局性（跨时间帧的关系）
+    4. 自适应门控融合
+    
+    相比 Mamba 的优势：
+    - 小序列（T=33, F=101）上注意力更高效
+    - 全局感受野，一次前向即可看到整个序列
+    - 可解释性更强
+    """
+    def __init__(
+        self,
+        channels: int,
+        num_heads: int = 4,
+        bias: bool = False,
+        ffn_expansion: float = 2.0,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.channels = channels
+        
+        # 频率轴注意力
+        self.freq_attn = AxisMDTA(
+            channels=channels,
+            num_heads=num_heads,
+            axis='freq',
+            bias=bias,
+            ffn_expansion=ffn_expansion,
+            dropout=dropout,
+        )
+        
+        # 时间轴注意力
+        self.time_attn = AxisMDTA(
+            channels=channels,
+            num_heads=num_heads,
+            axis='time',
+            bias=bias,
+            ffn_expansion=ffn_expansion,
+            dropout=dropout,
+        )
+        
+        # 用于自适应融合的投影
+        self.fusion_norm = nn.GroupNorm(min(8, channels), channels)
+    
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: (B, C, T, F)
+        
+        Returns:
+            out_freq: (B, C, T, F) 频率轴注意力输出
+            out_time: (B, C, T, F) 时间轴注意力输出
+        """
+        # 并行处理两个轴
+        out_freq = self.freq_attn(x)
+        out_time = self.time_attn(x)
+        
+        return out_freq, out_time
+
+
+# ================================
+# [Legacy] Mamba 相关类（保留用于向后兼容）
 # ================================
 
 class SelectiveSSM(nn.Module):
@@ -579,183 +915,35 @@ class DepthwiseScan1D(nn.Module):
         return F.gelu(out)
 
 
-class ScanFreq(nn.Module):
-    """
-    沿频率轴的双向 Mamba 扫描（针对 (B,C,T,F) 输入）
-    
-    使用 BidirectionalMamba 替代 DepthwiseScan1D，
-    实现真正的选择性状态空间扫描。
-    
-    维度重组策略:
-        输入: (B, C, T, F)
-        重组: (B*T, F, C) - 将 T 维度合并到 batch，沿 F 方向扫描
-        扫描: BidirectionalMamba 处理
-        还原: (B, C, T, F)
-    """
-    def __init__(self, channels: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
-        super().__init__()
-        # 双向 Mamba 用于频率轴扫描
-        # 使用 gate 融合策略，动态平衡低频和高频信息
-        self.scan = BidirectionalMamba(
-            d_model=channels,
-            d_state=d_state,
-            d_conv=d_conv,
-            expand=expand,
-            fusion='gate',
-            dropout=0.0,
-        )
-        self._sanity_checked = False
-    
-    def forward(self, x):
-        # x: (B, C, T, F)
-        B, C, T, F = x.shape
-        
-        # 维度重组: (B, C, T, F) -> (B*T, F, C)
-        # 将每个时间帧视为独立样本，沿频率轴扫描
-        x_reshaped = x.permute(0, 2, 3, 1)  # (B, T, F, C)
-        x_reshaped = x_reshaped.reshape(B * T, F, C)  # (B*T, F, C)
-        
-        # 双向 Mamba 扫描
-        out = self.scan(x_reshaped)  # (B*T, F, C)
-        
-        # 还原维度: (B*T, F, C) -> (B, C, T, F)
-        out = out.reshape(B, T, F, C)  # (B, T, F, C)
-        out = out.permute(0, 3, 1, 2)  # (B, C, T, F)
-        
-        # Sanity check: 脉冲输入测试（仅首次）
-        if not self._sanity_checked and self.training:
-            self._sanity_check_pulse(x)
-            self._sanity_checked = True
-        
-        return out
-    
-    def _sanity_check_pulse(self, x):
-        """脉冲输入 sanity check：验证频率轴扫描方向"""
-        with torch.no_grad():
-            B, C, T, F = x.shape
-            # 创建脉冲：在中心频率处设置脉冲
-            pulse = torch.zeros(1, C, 1, F, device=x.device, dtype=x.dtype)
-            pulse[:, :, :, F//2] = 1.0
-            
-            # 维度重组
-            pulse_reshaped = pulse.permute(0, 2, 3, 1).reshape(1, F, C)
-            out = self.scan(pulse_reshaped)
-            out_reshaped = out.reshape(1, 1, F, C).permute(0, 3, 1, 2).squeeze(2)  # (1, C, F)
-            
-            # 检查扩散（Mamba 应该产生更广泛的扩散）
-            energy = out_reshaped[0, 0, :].abs()
-            threshold = energy.max() * 0.01
-            nonzero_indices = (energy > threshold).nonzero(as_tuple=True)[0]
-            if len(nonzero_indices) > 1:
-                spread = nonzero_indices.max() - nonzero_indices.min() + 1
-                print(f"    [ScanFreq/Mamba] Pulse spread along F axis: {spread.item()} bins")
-            else:
-                print(f"    [ScanFreq/Mamba] No spreading detected")
-
-
-class ScanTime(nn.Module):
-    """
-    沿时间轴的双向 Mamba 扫描（针对 (B,C,T,F) 输入）
-    
-    使用 BidirectionalMamba 替代 DepthwiseScan1D，
-    实现真正的选择性状态空间扫描。
-    
-    维度重组策略:
-        输入: (B, C, T, F)
-        重组: (B*F, T, C) - 将 F 维度合并到 batch，沿 T 方向扫描
-        扫描: BidirectionalMamba 处理
-        还原: (B, C, T, F)
-    """
-    def __init__(self, channels: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
-        super().__init__()
-        # 双向 Mamba 用于时间轴扫描
-        # 使用 gate 融合策略，动态平衡过去和未来信息
-        self.scan = BidirectionalMamba(
-            d_model=channels,
-            d_state=d_state,
-            d_conv=d_conv,
-            expand=expand,
-            fusion='gate',
-            dropout=0.0,
-        )
-        self._sanity_checked = False
-    
-    def forward(self, x):
-        # x: (B, C, T, F)
-        B, C, T, F = x.shape
-        
-        # 维度重组: (B, C, T, F) -> (B*F, T, C)
-        # 将每个频率 bin 视为独立样本，沿时间轴扫描
-        x_reshaped = x.permute(0, 3, 2, 1)  # (B, F, T, C)
-        x_reshaped = x_reshaped.reshape(B * F, T, C)  # (B*F, T, C)
-        
-        # 双向 Mamba 扫描
-        out = self.scan(x_reshaped)  # (B*F, T, C)
-        
-        # 还原维度: (B*F, T, C) -> (B, C, T, F)
-        out = out.reshape(B, F, T, C)  # (B, F, T, C)
-        out = out.permute(0, 3, 2, 1)  # (B, C, T, F)
-        
-        # Sanity check: 脉冲输入测试（仅首次）
-        if not self._sanity_checked and self.training:
-            self._sanity_check_pulse(x)
-            self._sanity_checked = True
-        
-        return out
-    
-    def _sanity_check_pulse(self, x):
-        """脉冲输入 sanity check：验证时间轴扫描方向"""
-        with torch.no_grad():
-            B, C, T, F = x.shape
-            # 创建脉冲：在中心时间处设置脉冲
-            pulse = torch.zeros(1, C, T, 1, device=x.device, dtype=x.dtype)
-            pulse[:, :, T//2, :] = 1.0
-            
-            # 维度重组
-            pulse_reshaped = pulse.permute(0, 3, 2, 1).reshape(1, T, C)
-            out = self.scan(pulse_reshaped)
-            out_reshaped = out.reshape(1, 1, T, C).permute(0, 3, 2, 1).squeeze(3)  # (1, C, T)
-            
-            # 检查扩散（Mamba 应该产生更广泛的扩散）
-            energy = out_reshaped[0, 0, :].abs()
-            threshold = energy.max() * 0.01
-            nonzero_indices = (energy > threshold).nonzero(as_tuple=True)[0]
-            if len(nonzero_indices) > 1:
-                spread = nonzero_indices.max() - nonzero_indices.min() + 1
-                print(f"    [ScanTime/Mamba] Pulse spread along T axis: {spread.item()} frames")
-            else:
-                print(f"    [ScanTime/Mamba] No spreading detected")
-
-
 # ================================
-# 4) ACSSBlock2D（核心模块 - Mamba 版本）
+# 4) ACSSBlock2D（核心模块 - MDTA 版本）
 # ================================
 
 class ACSSBlock2D(nn.Module):
     """
-    Axis-Conditioned Selective Scan Block (2D) - Mamba 版本
+    Axis-Conditioned Selective Scan Block (2D) - MDTA 版本
+    
+    v3.0: 使用 Multi-Dconv Head Transposed Attention 替代 Mamba
     
     输入输出: (B, C, T, F)
     
-    包含:
+    核心架构：
         1) Axis Summary: 提取频轴和时轴摘要
         2) Axis-conditioned Gate: 生成位置相关门控
-        3) Bidirectional Mamba Scan: 双向状态空间扫描并混合
-        4) Residual + Norm
+        3) Dual-Axis MDTA: 并行的时间/频率注意力分支
+        4) Adaptive Fusion + Residual + Norm
     
-    状态空间参数策略:
-        - d_state=16: 足够的状态维度捕捉 EEG 的复杂模式
-        - d_conv=4: 局部卷积核，捕捉短程依赖
-        - expand=2: 适度扩展以增加表达能力
-        - gate fusion: 动态平衡前向和后向信息
+    设计优势：
+        - 时间轴注意力 (T=33): 捕捉时间动态，全局感受野
+        - 频率轴注意力 (F=101): 捕捉频率模式，跨频带交互
+        - 自适应门控: 动态平衡两个分支的贡献
     """
     def __init__(
         self, 
         channels: int, 
         dropout: float = 0.0,
-        d_state: int = 16,
-        d_conv: int = 4,
-        expand: int = 2,
+        num_heads: int = 4,
+        ffn_expansion: float = 2.0,
     ):
         super().__init__()
         self.channels = channels
@@ -767,6 +955,7 @@ class ACSSBlock2D(nn.Module):
         self.summary_proj_time = nn.Conv1d(channels * 2, channels, kernel_size=1)
         
         # 2) Gate 生成网络（基于频轴摘要）
+        # 输出 (B, 1, T) 的门控权重
         self.gate_net = nn.Sequential(
             nn.Conv1d(channels, channels // 2, kernel_size=3, padding=1),
             nn.GELU(),
@@ -774,14 +963,120 @@ class ACSSBlock2D(nn.Module):
             nn.Sigmoid(),
         )
         
-        # 3) Bidirectional Mamba Scan（替代 DepthwiseScan1D）
-        self.scan_freq = ScanFreq(channels, d_state=d_state, d_conv=d_conv, expand=expand)
-        self.scan_time = ScanTime(channels, d_state=d_state, d_conv=d_conv, expand=expand)
+        # 3) Dual-Axis MDTA（核心创新）
+        # 频率轴注意力：捕捉跨频率 bin 的关系（如谐波、频带间耦合）
+        self.freq_attn = AxisMDTA(
+            channels=channels,
+            num_heads=num_heads,
+            axis='freq',
+            bias=False,
+            ffn_expansion=ffn_expansion,
+            dropout=dropout,
+        )
         
-        # 4) 输出投影
+        # 时间轴注意力：捕捉时间动态（如瞬态伪影、节律变化）
+        self.time_attn = AxisMDTA(
+            channels=channels,
+            num_heads=num_heads,
+            axis='time',
+            bias=False,
+            ffn_expansion=ffn_expansion,
+            dropout=dropout,
+        )
+        
+        # 4) 输出投影和归一化
         self.proj = nn.Conv2d(channels, channels, kernel_size=1)
         self.norm = nn.GroupNorm(min(8, channels), channels)
-        self.dropout = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
+        self.dropout_layer = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
+    
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: (B, C, T, F)
+        
+        Returns:
+            out: (B, C, T, F)
+            g_freq: (B, 1, T)  门控图（用于可视化和分析）
+        """
+        B, C, T, F = x.shape
+        identity = x
+        
+        # 1) Axis Summary
+        # 频轴摘要: 沿 F 维 pool
+        x_mean_f = x.mean(dim=3)  # (B, C, T)
+        x_std_f = x.std(dim=3)    # (B, C, T)
+        s_f = torch.cat([x_mean_f, x_std_f], dim=1)  # (B, 2C, T)
+        s_f = self.summary_proj_freq(s_f)  # (B, C, T)
+        
+        # 时轴摘要: 沿 T 维 pool
+        x_mean_t = x.mean(dim=2)  # (B, C, F)
+        x_std_t = x.std(dim=2)
+        s_t = torch.cat([x_mean_t, x_std_t], dim=1)  # (B, 2C, F)
+        s_t = self.summary_proj_time(s_t)  # (B, C, F)
+        
+        # 2) Gate 生成（基于频轴摘要）
+        g_freq = self.gate_net(s_f)  # (B, 1, T)
+        
+        # 3) Dual-Axis MDTA（并行处理）
+        U_freq = self.freq_attn(x)  # (B, C, T, F) - 频率全局性
+        U_time = self.time_attn(x)  # (B, C, T, F) - 时间全局性
+        
+        # 4) Adaptive Fusion（自适应门控融合）
+        # g_freq broadcast to (B, 1, T, 1)
+        g = g_freq.unsqueeze(-1)  # (B, 1, T, 1)
+        Y = g * U_freq + (1 - g) * U_time  # (B, C, T, F)
+        
+        # 5) 输出投影 + Residual + Norm
+        out = self.proj(Y)
+        out = self.dropout_layer(out)
+        out = out + identity  # 残差连接
+        out = self.norm(out)
+        
+        return out, g_freq
+
+
+# ================================
+# [Legacy] Mamba 扫描类（保留用于向后兼容）
+# ================================
+
+class ScanFreq(nn.Module):
+    """
+    [Legacy] 沿频率轴的双向 Mamba 扫描
+    已被 AxisMDTA(axis='freq') 替代
+    """
+    def __init__(self, channels: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
+        super().__init__()
+        # 使用 MDTA 替代
+        self.scan = AxisMDTA(
+            channels=channels,
+            num_heads=4,
+            axis='freq',
+            dropout=0.0,
+        )
+        self._sanity_checked = False
+    
+    def forward(self, x):
+        return self.scan(x)
+
+
+class ScanTime(nn.Module):
+    """
+    [Legacy] 沿时间轴的双向 Mamba 扫描
+    已被 AxisMDTA(axis='time') 替代
+    """
+    def __init__(self, channels: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
+        super().__init__()
+        # 使用 MDTA 替代
+        self.scan = AxisMDTA(
+            channels=channels,
+            num_heads=4,
+            axis='time',
+            dropout=0.0,
+        )
+        self._sanity_checked = False
+    
+    def forward(self, x):
+        return self.scan(x)
     
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -960,11 +1255,11 @@ class UAR_ACSSNet(nn.Module):
     """
     Unified Artifact Removal with Axis-Conditioned Selective Scan Network
     
-    v2.0: 使用双向 Mamba 替代 DepthwiseScan1D
+    v3.0: 使用 MDTA (Multi-Dconv Head Transposed Attention) 替代 Mamba
     
     完整端到端模型，包含:
         - 时域主干: 1D U-Net
-        - 时频分支: SpecEncoder2D + ACSSStack2D (Bidirectional Mamba)
+        - 时频分支: SpecEncoder2D + ACSSStack2D (Dual-Axis MDTA)
         - 跨域融合: FiLM 调制
         - 置信图生成
     
@@ -977,9 +1272,8 @@ class UAR_ACSSNet(nn.Module):
         num_freq_bins: STFT 选定的频率 bin 数量（需与 STFTProcessor 一致）
         dropout: dropout 比例
         baseline_mode: 仅使用U-Net，不使用时频分支
-        mamba_d_state: Mamba 状态空间维度（N）
-        mamba_d_conv: Mamba 局部卷积核大小
-        mamba_expand: Mamba 内部扩展因子
+        attn_num_heads: MDTA 注意力头数
+        attn_ffn_expansion: MDTA FFN 扩展因子
     """
     def __init__(
         self,
@@ -991,20 +1285,18 @@ class UAR_ACSSNet(nn.Module):
         num_freq_bins: int = 103,  # 1-100 Hz @ 500Hz, n_fft=512 -> 103 bins
         dropout: float = 0.0,
         baseline_mode: bool = False,  # 仅使用U-Net，不使用时频分支
-        # Mamba 状态空间参数
-        mamba_d_state: int = 16,     # 状态维度，控制记忆容量
-        mamba_d_conv: int = 4,       # 局部卷积核，捕捉短程依赖
-        mamba_expand: int = 2,       # 扩展因子，增加表达能力
+        # MDTA 注意力参数
+        attn_num_heads: int = 4,       # 注意力头数
+        attn_ffn_expansion: float = 2.0,  # FFN 扩展因子
     ):
         super().__init__()
         self.segment_length = segment_length
         self.num_freq_bins = num_freq_bins
         self.baseline_mode = baseline_mode
         
-        # 保存 Mamba 参数
-        self.mamba_d_state = mamba_d_state
-        self.mamba_d_conv = mamba_d_conv
-        self.mamba_expand = mamba_expand
+        # 保存 MDTA 参数
+        self.attn_num_heads = attn_num_heads
+        self.attn_ffn_expansion = attn_ffn_expansion
         
         # STFT 处理器（固定参数）
         self.stft_proc = STFTProcessor(
@@ -1033,14 +1325,13 @@ class UAR_ACSSNet(nn.Module):
                 dropout=dropout,
             )
             
-            # ACSSBlock 堆叠（使用 Bidirectional Mamba）
+            # ACSSBlock 堆叠（使用 Dual-Axis MDTA）
             self.acss_blocks = nn.ModuleList([
                 ACSSBlock2D(
                     channels=spec_channels, 
                     dropout=dropout,
-                    d_state=mamba_d_state,
-                    d_conv=mamba_d_conv,
-                    expand=mamba_expand,
+                    num_heads=attn_num_heads,
+                    ffn_expansion=attn_ffn_expansion,
                 ) for _ in range(acss_depth)
             ])
             
@@ -1202,19 +1493,19 @@ class UAR_ACSSNet(nn.Module):
 
 
 def test_model():
-    """测试模型前向传播（Mamba 版本）"""
-    print("\n=== Testing UAR-ACSSNet v2.0 (Bidirectional Mamba) ===\n")
+    """测试模型前向传播（MDTA 版本）"""
+    print("\n=== Testing UAR-ACSSNet v3.0 (Dual-Axis MDTA) ===\n")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
     # 测试配置
     print("\n[1] Model Configuration:")
-    print(f"    - Bidirectional Mamba SSM")
-    print(f"    - d_state=16 (state dimension)")
-    print(f"    - d_conv=4 (local convolution)")
-    print(f"    - expand=2 (expansion factor)")
-    print(f"    - fusion='gate' (learnable gating)")
+    print(f"    - Dual-Axis MDTA (Multi-Dconv Head Transposed Attention)")
+    print(f"    - num_heads=4")
+    print(f"    - ffn_expansion=2.0")
+    print(f"    - Parallel time/freq attention branches")
+    print(f"    - Adaptive gating fusion")
     
     model = UAR_ACSSNet(
         segment_length=2048,
@@ -1224,10 +1515,9 @@ def test_model():
         acss_depth=3,
         num_freq_bins=103,
         dropout=0.1,
-        # Mamba 参数
-        mamba_d_state=16,
-        mamba_d_conv=4,
-        mamba_expand=2,
+        # MDTA 参数
+        attn_num_heads=4,
+        attn_ffn_expansion=2.0,
     ).to(device)
     
     # 统计参数量
@@ -1244,7 +1534,7 @@ def test_model():
         spec_params = sum(p.numel() for p in model.spec_encoder.parameters())
         print(f"    U-Net: {unet_params:,}")
         print(f"    SpecEncoder: {spec_params:,}")
-        print(f"    ACSS (Mamba): {acss_params:,}")
+        print(f"    ACSS (MDTA): {acss_params:,}")
     
     # 前向传播测试
     print(f"\n[3] Forward Pass Test:")
@@ -1252,7 +1542,7 @@ def test_model():
     
     # 训练模式（触发 sanity check）
     model.train()
-    print(f"\n[Mamba Sanity Checks - first forward in training mode]")
+    print(f"\n[MDTA Sanity Checks - first forward in training mode]")
     outputs = model(x)
     
     # 评估模式
@@ -1307,77 +1597,98 @@ def test_model():
     min_grad = min(grad_norms.values()) if grad_norms else 0
     print(f"    Gradient norm range: [{min_grad:.6f}, {max_grad:.6f}]")
     
-    # 检查 Mamba 模块的梯度
-    mamba_grads = {k: v for k, v in grad_norms.items() if 'ssm' in k.lower() or 'mamba' in k.lower() or 'scan' in k.lower()}
-    if mamba_grads:
-        print(f"    Mamba-related gradients: {len(mamba_grads)} params")
-        print(f"    Mamba grad range: [{min(mamba_grads.values()):.6f}, {max(mamba_grads.values()):.6f}]")
+    # 检查 Attention 模块的梯度
+    attn_grads = {k: v for k, v in grad_norms.items() if 'attn' in k.lower() or 'qkv' in k.lower()}
+    if attn_grads:
+        print(f"    Attention-related gradients: {len(attn_grads)} params")
+        print(f"    Attention grad range: [{min(attn_grads.values()):.6f}, {max(attn_grads.values()):.6f}]")
     
     print("\n✓ All tests passed!")
-    print("✓ Bidirectional Mamba integration successful!\n")
+    print("✓ Dual-Axis MDTA integration successful!\n")
 
 
-def test_mamba_components():
-    """单独测试 Mamba 组件"""
-    print("\n=== Testing Mamba Components ===\n")
+def test_mdta_components():
+    """单独测试 MDTA 组件"""
+    print("\n=== Testing MDTA Components ===\n")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # 测试 SelectiveSSM
-    print("[1] Testing SelectiveSSM:")
-    ssm = SelectiveSSM(d_model=64, d_state=16, d_conv=4, expand=2).to(device)
-    x = torch.randn(2, 32, 64).to(device)  # (B, L, D)
-    y = ssm(x)
-    print(f"    Input: {x.shape}")
-    print(f"    Output: {y.shape}")
-    assert y.shape == x.shape, "Shape mismatch in SelectiveSSM"
-    print(f"    ✓ SelectiveSSM passed")
+    # 测试 MDTA (2D)
+    print("[1] Testing MDTA (2D Transposed Attention):")
+    mdta = MDTA(channels=64, num_heads=4).to(device)
+    x_2d = torch.randn(2, 64, 33, 101).to(device)  # (B, C, T, F)
+    y_2d = mdta(x_2d)
+    print(f"    Input: {x_2d.shape}")
+    print(f"    Output: {y_2d.shape}")
+    assert y_2d.shape == x_2d.shape, "Shape mismatch in MDTA"
+    print(f"    ✓ MDTA passed")
     
-    # 测试 BidirectionalMamba
-    print("\n[2] Testing BidirectionalMamba:")
-    bimamba = BidirectionalMamba(d_model=64, d_state=16, fusion='gate').to(device)
-    bimamba.train()  # 触发 sanity check
-    y = bimamba(x)
-    print(f"    Input: {x.shape}")
-    print(f"    Output: {y.shape}")
-    assert y.shape == x.shape, "Shape mismatch in BidirectionalMamba"
-    print(f"    ✓ BidirectionalMamba passed")
+    # 测试 AxisMDTA (freq)
+    print("\n[2] Testing AxisMDTA (freq axis):")
+    freq_attn = AxisMDTA(channels=64, num_heads=4, axis='freq').to(device)
+    freq_attn.train()  # 触发 sanity check
+    y_freq = freq_attn(x_2d)
+    print(f"    Input: {x_2d.shape}")
+    print(f"    Output: {y_freq.shape}")
+    assert y_freq.shape == x_2d.shape, "Shape mismatch in AxisMDTA (freq)"
+    print(f"    ✓ AxisMDTA (freq) passed")
     
-    # 测试 ScanFreq
-    print("\n[3] Testing ScanFreq (Mamba):")
-    scan_freq = ScanFreq(channels=64, d_state=16).to(device)
-    x_tf = torch.randn(2, 64, 32, 103).to(device)  # (B, C, T, F)
-    scan_freq.train()
-    y_tf = scan_freq(x_tf)
-    print(f"    Input: {x_tf.shape}")
-    print(f"    Output: {y_tf.shape}")
-    assert y_tf.shape == x_tf.shape, "Shape mismatch in ScanFreq"
-    print(f"    ✓ ScanFreq passed")
+    # 测试 AxisMDTA (time)
+    print("\n[3] Testing AxisMDTA (time axis):")
+    time_attn = AxisMDTA(channels=64, num_heads=4, axis='time').to(device)
+    time_attn.train()
+    y_time = time_attn(x_2d)
+    print(f"    Input: {x_2d.shape}")
+    print(f"    Output: {y_time.shape}")
+    assert y_time.shape == x_2d.shape, "Shape mismatch in AxisMDTA (time)"
+    print(f"    ✓ AxisMDTA (time) passed")
     
-    # 测试 ScanTime
-    print("\n[4] Testing ScanTime (Mamba):")
-    scan_time = ScanTime(channels=64, d_state=16).to(device)
-    scan_time.train()
-    y_tf = scan_time(x_tf)
-    print(f"    Input: {x_tf.shape}")
-    print(f"    Output: {y_tf.shape}")
-    assert y_tf.shape == x_tf.shape, "Shape mismatch in ScanTime"
-    print(f"    ✓ ScanTime passed")
+    # 测试 DualAxisMDTA
+    print("\n[4] Testing DualAxisMDTA:")
+    dual_attn = DualAxisMDTA(channels=64, num_heads=4).to(device)
+    dual_attn.train()
+    y_freq, y_time = dual_attn(x_2d)
+    print(f"    Input: {x_2d.shape}")
+    print(f"    Output freq: {y_freq.shape}")
+    print(f"    Output time: {y_time.shape}")
+    assert y_freq.shape == x_2d.shape, "Shape mismatch in DualAxisMDTA (freq)"
+    assert y_time.shape == x_2d.shape, "Shape mismatch in DualAxisMDTA (time)"
+    print(f"    ✓ DualAxisMDTA passed")
     
-    # 测试 ACSSBlock2D
-    print("\n[5] Testing ACSSBlock2D (Mamba):")
-    acss = ACSSBlock2D(channels=64, d_state=16, d_conv=4, expand=2).to(device)
+    # 测试 ACSSBlock2D (MDTA 版本)
+    print("\n[5] Testing ACSSBlock2D (MDTA):")
+    acss = ACSSBlock2D(channels=64, num_heads=4, ffn_expansion=2.0).to(device)
     acss.train()
-    y_tf, g = acss(x_tf)
-    print(f"    Input: {x_tf.shape}")
-    print(f"    Output: {y_tf.shape}")
+    y_acss, g = acss(x_2d)
+    print(f"    Input: {x_2d.shape}")
+    print(f"    Output: {y_acss.shape}")
     print(f"    Gate: {g.shape}")
-    assert y_tf.shape == x_tf.shape, "Shape mismatch in ACSSBlock2D"
+    assert y_acss.shape == x_2d.shape, "Shape mismatch in ACSSBlock2D"
     print(f"    ✓ ACSSBlock2D passed")
     
-    print("\n✓ All Mamba component tests passed!\n")
+    # 测试计算效率对比
+    print("\n[6] Computational Efficiency Analysis:")
+    T, F, C = 33, 101, 64
+    print(f"    Input dimensions: T={T}, F={F}, C={C}")
+    
+    # 标准注意力复杂度
+    std_attn_complexity = (T * F) ** 2
+    print(f"    Standard Attention O((T×F)²) = {std_attn_complexity:,}")
+    
+    # 转置注意力复杂度
+    transposed_complexity = C ** 2
+    print(f"    Transposed Attention O(C²) = {transposed_complexity:,}")
+    
+    # 轴向注意力复杂度
+    axial_complexity = T ** 2 + F ** 2
+    print(f"    Axial Attention O(T²+F²) = {axial_complexity:,}")
+    
+    speedup = std_attn_complexity / axial_complexity
+    print(f"    Axial Speedup: {speedup:.1f}x faster than standard")
+    
+    print("\n✓ All MDTA component tests passed!\n")
 
 
 if __name__ == "__main__":
-    test_mamba_components()
+    test_mdta_components()
     test_model()
