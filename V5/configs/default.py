@@ -46,6 +46,10 @@ def get_default_config():
         "acss_depth": 3,                  # ACSSBlock 堆叠层数
         "num_freq_bins": 101,             # STFT 频率 bin 数量（1-100Hz @ fs=500, n_fft=512）
         
+        # MDTA 注意力参数 (v3.0)
+        "attn_num_heads": 4,              # 注意力头数
+        "attn_ffn_expansion": 2.0,        # FFN 扩展因子
+        
         # 其他
         "dropout": 0.1,                   # dropout 比例
         

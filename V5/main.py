@@ -123,7 +123,7 @@ def main():
         train_transform=train_transform,  # 数据增强
     )
     
-    # 创建模型
+    # 创建模型 (v3.0: MDTA 注意力版本)
     print("\nBuilding model...")
     model = UAR_ACSSNet(
         segment_length=cfg["segment_length"],
@@ -134,12 +134,15 @@ def main():
         num_freq_bins=cfg["num_freq_bins"],
         dropout=cfg["dropout"],
         baseline_mode=cfg.get("baseline_mode", False),
+        # v3.0: MDTA 注意力参数
+        attn_num_heads=cfg.get("attn_num_heads", 4),
+        attn_ffn_expansion=cfg.get("attn_ffn_expansion", 2.0),
     ).to(device)
     
     if cfg.get("baseline_mode", False):
         print("🔹 Baseline Mode: Using pure U-Net (no FiLM/ACSS)")
     else:
-        print("🔹 Full Mode: UAR-ACSSNet with FiLM modulation")
+        print(f"🔹 Full Mode: UAR-ACSSNet v3.0 (MDTA, heads={cfg.get('attn_num_heads', 4)})")
     
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

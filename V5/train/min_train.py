@@ -405,7 +405,7 @@ def main_minimal_example():
     from ..configs.default import get_default_config
     cfg = get_default_config()
     
-    # 模型
+    # 模型 (v3.0: MDTA 注意力版本)
     from ..models import UAR_ACSSNet
     model = UAR_ACSSNet(
         segment_length=cfg["segment_length"],
@@ -415,6 +415,10 @@ def main_minimal_example():
         acss_depth=cfg["acss_depth"],
         num_freq_bins=cfg["num_freq_bins"],
         dropout=cfg["dropout"],
+        baseline_mode=cfg.get("baseline_mode", False),
+        # v3.0: MDTA 注意力参数
+        attn_num_heads=cfg.get("attn_num_heads", 4),
+        attn_ffn_expansion=cfg.get("attn_ffn_expansion", 2.0),
     ).to(device)
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}\n")

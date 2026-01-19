@@ -18,18 +18,19 @@ from configs.default import get_default_config
 
 def load_model(checkpoint_path, device='cuda', baseline_mode=None):
     """
-    加载训练好的模型
+    加载训练好的模型 (v3.0 - MDTA 版本)
     
     Args:
         checkpoint_path: checkpoint文件路径
         device: 设备
+        baseline_mode: 是否使用baseline模式（None则从checkpoint获取）
     
     Returns:
         model: 加载好的模型
         cfg: 配置字典
     """
     print(f"\n📦 Loading checkpoint from: {checkpoint_path}")
-    ckpt = torch.load(checkpoint_path, map_location=device)
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
     # 从checkpoint获取配置（如果有）或使用默认配置
     if 'cfg' in ckpt:
@@ -39,7 +40,7 @@ def load_model(checkpoint_path, device='cuda', baseline_mode=None):
         cfg = get_default_config()
         print("✓ Using default config")
     
-    # 创建模型
+    # 创建模型 (v3.0: 支持 MDTA 注意力参数)
     # 允许通过入参覆盖 baseline_mode；否则使用配置中的值，默认完整模式(False)
     bm = cfg.get("baseline_mode", False) if baseline_mode is None else baseline_mode
     model = UAR_ACSSNet(
@@ -51,6 +52,9 @@ def load_model(checkpoint_path, device='cuda', baseline_mode=None):
         num_freq_bins=cfg.get("num_freq_bins", 101),
         dropout=cfg.get("dropout", 0.0),
         baseline_mode=bm,
+        # v3.0: MDTA 注意力参数
+        attn_num_heads=cfg.get("attn_num_heads", 4),
+        attn_ffn_expansion=cfg.get("attn_ffn_expansion", 2.0),
     ).to(device)
     
     # 加载权重
@@ -66,7 +70,11 @@ def load_model(checkpoint_path, device='cuda', baseline_mode=None):
     
     total_params = sum(p.numel() for p in model.parameters())
     print(f"✓ Total parameters: {total_params:,}")
-    print(f"✓ Mode: {'Full UAR-ACSSNet' if not model.baseline_mode else 'Baseline U-Net'}")
+    print(f"✓ Mode: {'Full UAR-ACSSNet (MDTA v3.0)' if not model.baseline_mode else 'Baseline U-Net'}")
+    
+    # 打印 MDTA 配置（仅非baseline模式）
+    if not model.baseline_mode:
+        print(f"✓ MDTA config: heads={model.attn_num_heads}, ffn_expansion={model.attn_ffn_expansion}")
     
     return model, cfg
 
